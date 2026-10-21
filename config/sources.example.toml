@@ -1,0 +1,53 @@
+# Template records only. Real board tokens/Workday site identifiers MUST be
+# discovered and verified before enabling these, not inferred from employer names.
+
+[[sources]]
+key = "example-greenhouse"
+kind = "greenhouse"
+organization = "Example employer — replace"
+board_token = "REPLACE_WITH_VERIFIED_BOARD_TOKEN"
+enabled = false
+refresh_hours = 6
+
+[[sources]]
+key = "example-lever"
+kind = "lever"
+organization = "Example employer — replace"
+site_id = "REPLACE_WITH_VERIFIED_SITE_ID"
+enabled = false
+refresh_hours = 6
+
+[[sources]]
+key = "example-ashby"
+kind = "ashby"
+organization = "Example employer — replace"
+board_slug = "REPLACE_WITH_VERIFIED_BOARD_SLUG"
+enabled = false
+refresh_hours = 6
+
+[[sources]]
+key = "example-workday"
+kind = "workday"
+organization = "Example employer — replace"
+tenant = "REPLACE_WITH_VERIFIED_TENANT"
+instance = "REPLACE_WITH_VERIFIED_INSTANCE"
+site = "REPLACE_WITH_VERIFIED_SITE"
+enabled = false
+refresh_hours = 12
+
+[[sources]]
+key = "example-academic"
+kind = "academic_html"
+organization = "Example university — replace"
+url = "https://example.org/theses"
+enabled = false
+refresh_hours = 24
+
+[[sources]]
+key = "apple-careers-manual"
+kind = "manual"
+organization = "Apple"
+url = "https://jobs.apple.com/"
+enabled = false
+refresh_hours = 24
+notes = "Manual watch only until explicit supported adapter is verified"

@@ -1,0 +1,74 @@
+name: repository hygiene and builds
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://opportunity:opportunity@127.0.0.1:5432/opportunity_test
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: opportunity
+          POSTGRES_PASSWORD: opportunity
+          POSTGRES_DB: opportunity_test
+        options: >-
+          --health-cmd "pg_isready -U opportunity -d opportunity_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Privacy and regression guard
+        run: |
+          python3 scripts/check_privacy.py
+          python3 scripts/test_privacy.py
+      - name: Rust format, lint and tests (once workspace exists)
+        shell: bash
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            cargo fmt --all -- --check
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace
+          else
+            echo 'No Cargo workspace yet, Rust code not implemented.'
+          fi
+      - name: Frontend checks (once app exists)
+        shell: bash
+        run: |
+          if [[ -f apps/web/package.json ]]; then
+            cd apps/web
+            npm ci
+            npm run typecheck
+            npm run build
+            npm test
+          else
+            echo 'Frontend not yet implemented.'
+          fi
+      - name: Browser worker checks (once app exists)
+        shell: bash
+        run: |
+          if [[ -f apps/browser-worker/package.json ]]; then
+            cd apps/browser-worker
+            npm ci
+            npm run typecheck
+            npx playwright install --with-deps chromium
+            npm test
+          else
+            echo 'Browser worker not yet implemented.'
+          fi

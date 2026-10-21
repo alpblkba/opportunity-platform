@@ -1,0 +1,34 @@
+# Local personal data (including EPOCH-style local agent traces)
+/private/
+.env
+.env.*
+!.env.example
+/target/
+/node_modules/
+**/node_modules/
+**/dist/
+**/coverage/
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.pem
+*.key
+*.p12
+*.pfx
+*.docx
+*.pdf
+*.pages
+*.rtf
+# Explicitly sanitized/synthetic binary test fixtures; never use real CVs.
+!/tests/fixtures/**/*.docx
+!/tests/fixtures/**/*.pdf
+!/tests/fixtures/*.docx
+!/tests/fixtures/*.pdf
+!**/tests/fixtures/**/*.docx
+!**/tests/fixtures/**/*.pdf
+!**/tests/fixtures/*.docx
+!**/tests/fixtures/*.pdf
+.DS_Store
+__pycache__/
+*.pyc

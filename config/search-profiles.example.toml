@@ -1,0 +1,39 @@
+# Public non-personal example; user-specific profiles and CVs go under private/.
+# Import these defaults into the UI; all parameters are editable.
+
+[preferences]
+preferred_countries = ["DE", "SE", "FI", "NO", "US", "CA", "IE"]
+preferred_cities = ["Karlsruhe", "Munich", "Stockholm", "Helsinki", "Tampere", "Gothenburg", "Seattle", "San Francisco", "Vancouver"]
+relocation_willing = true
+minimum_rank_score = 50
+include_unknown_eligibility = true
+
+[blacklist]
+companies = []
+title_terms = []
+description_terms = []
+excluded_sites = []
+
+[profiles.firmware]
+display_name = "Firmware / Platform Systems"
+types = ["employment", "internship", "working_student"]
+terms = ["firmware", "embedded C", "RTOS", "IPC", "RTKit", "AOP", "SMC", "PMU", "SoC", "bootloader", "DMA", "device driver", "low-level systems"]
+negative_terms = ["cellular PHY", "RF antenna design"]
+
+[profiles.architecture]
+display_name = "Computer Architecture / Memory Systems"
+types = ["employment", "internship", "master_thesis", "research_assistant"]
+terms = ["DRAM", "CXL", "memory tiering", "page migration", "memory disaggregation", "RISC-V", "microarchitecture", "accelerators", "GPU memory", "cache", "hardware software codesign"]
+negative_terms = []
+
+[profiles.security]
+display_name = "Hardware Security Research"
+types = ["employment", "internship", "master_thesis", "research_assistant", "phd"]
+terms = ["speculative execution", "transient execution", "microarchitectural security", "RTL verification", "formal verification", "RowHammer", "read disturbance"]
+negative_terms = []
+
+[profiles.thesis]
+display_name = "Master Thesis / Research"
+types = ["master_thesis", "research_assistant", "internship", "phd"]
+terms = ["Masterarbeit", "Master thesis", "near-memory", "operating systems", "DRAM reliability", "RISC-V", "memory systems", "hardware security", "SoC", "accelerator"]
+negative_terms = []
