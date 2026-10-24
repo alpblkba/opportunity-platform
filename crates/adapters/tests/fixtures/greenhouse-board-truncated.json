@@ -1,0 +1,23 @@
+{
+  "jobs": [
+    {
+      "id": 5000000009,
+      "internal_job_id": 4000000009,
+      "title": "Verification Engineer",
+      "absolute_url": "https://job-boards.greenhouse.io/examplesilicon/jobs/5000000009",
+      "company_name": "Example Silicon",
+      "requisition_id": "REQ-1009",
+      "location": { "name": "Munich, Germany" },
+      "departments": [],
+      "offices": [],
+      "first_published": "2026-10-01T09:15:00-04:00",
+      "updated_at": "2026-10-01T09:15:00-04:00",
+      "application_deadline": null,
+      "language": "en",
+      "metadata": [],
+      "data_compliance": [],
+      "content": "&lt;p&gt;Formal and simulation-based verification of memory subsystem RTL.&lt;/p&gt;"
+    }
+  ],
+  "meta": { "total": 9 }
+}

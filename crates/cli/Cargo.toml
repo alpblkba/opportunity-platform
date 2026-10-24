@@ -1,0 +1,25 @@
+[package]
+name = "opportunity-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The opportunity platform binary: migrate, serve and scan."
+
+[[bin]]
+name = "opportunity"
+path = "src/main.rs"
+
+[dependencies]
+opportunity-adapters.workspace = true
+opportunity-api.workspace = true
+rpassword = "7"
+opportunity-core.workspace = true
+opportunity-domain.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

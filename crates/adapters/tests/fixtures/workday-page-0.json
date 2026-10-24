@@ -1,0 +1,26 @@
+{
+  "total": 42,
+  "jobPostings": [
+    {
+      "title": "Senior Firmware Engineer",
+      "externalPath": "/en-US/careers/job/Munich/Senior-Firmware-Engineer_R-100001",
+      "locationsText": "Munich, Germany",
+      "postedOn": "Posted 5 Days Ago",
+      "bulletFields": ["R-100001"]
+    },
+    {
+      "title": "Memory Subsystem Verification Engineer",
+      "externalPath": "/en-US/careers/job/Munich/Memory-Subsystem-Verification-Engineer_R-100002",
+      "locationsText": "Munich, Germany",
+      "postedOn": "Posted 12 Days Ago",
+      "bulletFields": ["R-100002"]
+    },
+    {
+      "title": "Werkstudent SoC Integration",
+      "externalPath": "/en-US/careers/job/Dresden/Werkstudent-SoC-Integration_R-100003",
+      "locationsText": "Dresden, Germany",
+      "postedOn": "Posted 30+ Days Ago",
+      "bulletFields": ["R-100003"]
+    }
+  ]
+}

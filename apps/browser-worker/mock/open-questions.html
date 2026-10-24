@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- Local mock ATS: a routine form that happens to ask two things the approved facts do not cover, one of them sensitive. Entirely synthetic; it exists so the review workflow can be exercised end to end without touching a real employer. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Instruments - Apply</title></head>
+<body>
+<h1>Apply: Embedded Systems Intern</h1>
+<form id="application" method="post" action="/submit/open">
+  <label for="full-name">Full name</label>
+  <input id="full-name" name="full name" type="text" maxlength="120" required />
+
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" maxlength="160" required />
+
+  <label for="notice">Notice period</label>
+  <input id="notice" name="notice period" type="text" maxlength="40" required />
+
+  <label for="visa">Do you require visa sponsorship?</label>
+  <select id="visa" name="do you require visa sponsorship" required>
+    <option value="">Choose one</option>
+    <option value="No">No</option>
+    <option value="Yes">Yes</option>
+  </select>
+
+  <label for="cv">Upload your CV</label>
+  <input id="cv" name="cv" type="file" required />
+
+  <button id="submit" type="submit">Submit application</button>
+</form>
+</body>
+</html>

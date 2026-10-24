@@ -1,0 +1,22 @@
+[package]
+name = "opportunity-adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Public job-listing source adapters. Read-only HTTP GET against documented board APIs."
+
+[dependencies]
+opportunity-domain.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+scraper = "0.29"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }

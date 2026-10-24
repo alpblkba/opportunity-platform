@@ -1,0 +1,39 @@
+<!doctype html>
+<!-- Local mock ATS: an ordinary single-page application form. Entirely synthetic; it exists so the submission workflow can be exercised end to end without touching a real employer. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Silicon - Apply</title></head>
+<body>
+<h1>Apply: Firmware Engineer, Platform</h1>
+<form id="application" method="post" action="/submit/single">
+  <label for="full-name">Full name</label>
+  <input id="full-name" name="full name" type="text" maxlength="120" required />
+
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" maxlength="160" required />
+
+  <label for="phone">Phone</label>
+  <input id="phone" name="phone" type="tel" maxlength="40" required />
+
+  <label for="location">Current location</label>
+  <input id="location" name="current location" type="text" maxlength="120" required />
+
+  <label for="start">Earliest start date</label>
+  <input id="start" name="earliest start date" type="text" maxlength="40" required />
+
+  <label for="source">How did you hear about us?</label>
+  <select id="source" name="how did you hear about us" required>
+    <option value="">Choose one</option>
+    <option value="Company website">Company website</option>
+    <option value="Referral">Referral</option>
+    <option value="Conference">Conference</option>
+  </select>
+
+  <label for="cv">Upload your CV</label>
+  <input id="cv" name="cv" type="file" required />
+
+  <label for="terms"><input id="terms" name="i agree to the privacy policy" type="checkbox" required /> I agree to the privacy policy</label>
+
+  <button id="submit" type="submit">Submit application</button>
+</form>
+</body>
+</html>

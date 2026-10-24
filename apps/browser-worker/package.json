@@ -1,0 +1,23 @@
+{
+  "name": "opportunity-browser-worker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "mock": "node dist/mock-server.js",
+    "build": "tsc",
+    "test": "node --test dist/*.test.js",
+    "worker": "node dist/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "playwright": "^1.56.0"
+  },
+  "allowScripts": {
+    "playwright": true
+  }
+}

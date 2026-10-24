@@ -1,0 +1,59 @@
+[
+  {
+    "id": "c0000000-0000-0000-0000-000000000001",
+    "text": "Platform Software Engineer",
+    "hostedUrl": "https://jobs.lever.co/exampleautonomy/c0000000-0000-0000-0000-000000000001",
+    "applyUrl": "https://jobs.lever.co/exampleautonomy/c0000000-0000-0000-0000-000000000001/apply",
+    "country": "SE",
+    "workplaceType": "onsite",
+    "createdAt": 1759312800000,
+    "categories": {
+      "commitment": "Full Time Employee",
+      "department": "Avionics",
+      "location": "Stockholm",
+      "team": "Flight Software",
+      "allLocations": ["Stockholm"]
+    },
+    "description": "<div><p>Build the flight software platform: board bring-up, device drivers and deterministic IPC between compute islands.</p></div>",
+    "descriptionPlain": "Build the flight software platform.",
+    "lists": []
+  },
+  {
+    "id": "c0000000-0000-0000-0000-000000000002",
+    "text": "Masterarbeit: Speicherhierarchien für RISC-V",
+    "hostedUrl": "https://jobs.lever.co/exampleautonomy/c0000000-0000-0000-0000-000000000002",
+    "applyUrl": "https://jobs.lever.co/exampleautonomy/c0000000-0000-0000-0000-000000000002/apply",
+    "country": "DE",
+    "workplaceType": "onsite",
+    "createdAt": 1760176800000,
+    "categories": {
+      "commitment": "Intern",
+      "department": "Forschung",
+      "location": "Karlsruhe",
+      "team": "Rechnerarchitektur",
+      "allLocations": ["Karlsruhe"]
+    },
+    "description": "<div><p>Abschlussarbeit zu Speicherhierarchien und Seitenmigration auf einer RISC-V-Plattform. Betreuung durch die Gruppe Rechnerarchitektur.</p></div>",
+    "descriptionPlain": "Abschlussarbeit zu Speicherhierarchien.",
+    "lists": []
+  },
+  {
+    "id": "c0000000-0000-0000-0000-000000000003",
+    "text": "Site Reliability Engineer",
+    "hostedUrl": null,
+    "applyUrl": "https://jobs.lever.co/exampleautonomy/c0000000-0000-0000-0000-000000000003/apply",
+    "country": "US",
+    "workplaceType": "remote",
+    "createdAt": 1758103200000,
+    "categories": {
+      "commitment": "Full Time Employee",
+      "department": "Infrastructure",
+      "location": "Remote - US only",
+      "team": "Platform",
+      "allLocations": ["Remote - US only"]
+    },
+    "description": "",
+    "descriptionPlain": "",
+    "lists": []
+  }
+]

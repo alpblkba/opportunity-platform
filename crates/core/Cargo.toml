@@ -1,0 +1,29 @@
+[package]
+name = "opportunity-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Persistence, source registry and the ingest pipeline."
+
+[dependencies]
+opportunity-adapters.workspace = true
+opportunity-domain.workspace = true
+anyhow.workspace = true
+argon2.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+chrono.workspace = true
+uuid.workspace = true

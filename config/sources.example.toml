@@ -39,7 +39,7 @@ refresh_hours = 12
 key = "example-academic"
 kind = "academic_html"
 organization = "Example university — replace"
-url = "https://example.org/theses"
+url = "https://REPLACE_WITH_VERIFIED_UNIVERSITY_HOST/theses"
 enabled = false
 refresh_hours = 24
 

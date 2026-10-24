@@ -1,0 +1,23 @@
+# Local single-user development stack. The database binds to loopback only.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: opportunity-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: opportunity
+      POSTGRES_PASSWORD: opportunity_local_dev
+      POSTGRES_DB: opportunity
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - opportunity-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opportunity -d opportunity"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  opportunity-db-data:
+    name: opportunity-db-data

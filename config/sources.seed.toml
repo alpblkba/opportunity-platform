@@ -1,0 +1,125 @@
+# Verified seed sources. Every board identifier here was confirmed on 2026-10-22 by a read-only GET against the provider's documented public listing API, and each returned HTTP 200 with a non-empty job array. Identifiers are never inferred from an employer's name: an entry only appears here after its endpoint actually answered.
+# Re-verify before trusting counts: a board token can be retired at any time, and this file records what was true at import, not what is true now.
+
+[[sources]]
+key = "tenstorrent-greenhouse"
+kind = "greenhouse"
+organization = "Tenstorrent"
+board_token = "tenstorrent"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "ai-accelerator", "risc-v"]
+
+[[sources]]
+key = "asteralabs-greenhouse"
+kind = "greenhouse"
+organization = "Astera Labs"
+board_token = "asteralabs"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "cxl", "connectivity"]
+
+[[sources]]
+key = "cerebras-ashby"
+kind = "ashby"
+organization = "Cerebras Systems"
+board_slug = "cerebras"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "wafer-scale", "compiler"]
+
+[[sources]]
+key = "shieldai-lever"
+kind = "lever"
+organization = "Shield AI"
+site_id = "shieldai"
+enabled = true
+refresh_hours = 6
+tags = ["avionics", "embedded", "autonomy"]
+
+# Registered so the coverage gap is visible, not because jobs are discovered from it. No adapter runs against a manual entry.
+[[sources]]
+key = "apple-careers-manual"
+kind = "manual"
+organization = "Apple"
+url = "https://jobs.apple.com/"
+enabled = false
+refresh_hours = 24
+notes = "manual watch only until a supported adapter is verified"
+
+# Added 2026-10-22 (session 2). Each board identifier below was confirmed the same way as those above: a read-only request that returned HTTP 200 with a non-empty result.
+
+[[sources]]
+key = "graphcore-greenhouse"
+kind = "greenhouse"
+organization = "Graphcore"
+board_token = "graphcore"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "ai-accelerator", "uk"]
+
+[[sources]]
+key = "sambanova-greenhouse"
+kind = "greenhouse"
+organization = "SambaNova Systems"
+board_token = "sambanovasystems"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "ai-accelerator", "dataflow"]
+
+[[sources]]
+key = "lightmatter-greenhouse"
+kind = "greenhouse"
+organization = "Lightmatter"
+board_token = "lightmatter"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "photonics", "interconnect"]
+
+[[sources]]
+key = "celonis-greenhouse"
+kind = "greenhouse"
+organization = "Celonis"
+board_token = "celonis"
+enabled = true
+refresh_hours = 6
+tags = ["munich", "germany", "software"]
+
+[[sources]]
+key = "isaraerospace-greenhouse"
+kind = "greenhouse"
+organization = "Isar Aerospace"
+board_token = "isaraerospace"
+enabled = true
+refresh_hours = 6
+tags = ["munich", "germany", "embedded", "avionics"]
+
+[[sources]]
+key = "axelera-ashby"
+kind = "ashby"
+organization = "Axelera AI"
+board_slug = "axelera"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "edge-ai", "europe"]
+
+[[sources]]
+key = "etched-ashby"
+kind = "ashby"
+organization = "Etched"
+board_slug = "etched"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "ai-accelerator"]
+
+# Academic source. The listing page is the canonical career site for the institute and its affiliated entities; robots.txt permits /search/ and disallows only the apply paths, which this tool never visits. The adapter reads the listing table only and never follows a row through to a job or application page.
+[[sources]]
+key = "hpi-academic"
+kind = "academic_html"
+organization = "Hasso Plattner Institute"
+url = "https://jobs.plattnerfoundation.org/search/"
+pattern = "successfactors"
+enabled = true
+refresh_hours = 24
+tags = ["academic", "germany", "potsdam", "research"]
+notes = "shared career site: rows for affiliated Plattner Foundation entities also appear"

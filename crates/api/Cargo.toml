@@ -1,0 +1,34 @@
+[package]
+name = "opportunity-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Loopback HTTP API for the opportunity platform."
+
+[dependencies]
+opportunity-adapters.workspace = true
+opportunity-core.workspace = true
+opportunity-domain.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+# A crypto provider must be chosen explicitly or signature verification panics at runtime on the first real assertion. rust_crypto is pure Rust, which keeps the multi-architecture image build free of a C toolchain.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+reqwest.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The assertion tests sign with a PEM key. Production builds keys from the JWK components instead, so `use_pem` is deliberately a test-only feature and the shipped binary does not carry the PEM parser.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+chrono.workspace = true
+# The native-auth tests drive the assembled router on a real socket, which needs a database to
+# create and drop and a client that does not follow redirects or keep cookies for them.
+opportunity-adapters.workspace = true

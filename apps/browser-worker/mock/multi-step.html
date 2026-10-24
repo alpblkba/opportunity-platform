@@ -1,0 +1,56 @@
+<!doctype html>
+<!-- Local mock ATS: a multi-step form whose second step reveals a required question only after the first step is completed, and whose third step asks for personal writing. Entirely synthetic. -->
+<html lang="en">
+<head><meta charset="utf-8"><title>Example Institut - Bewerbung</title></head>
+<body>
+<h1>Apply: Masterarbeit Speichersysteme</h1>
+<form id="application" method="post" action="/submit/multi">
+  <fieldset id="step-1" data-step="1">
+    <legend>Step 1 of 3: about you</legend>
+    <label for="full-name">Full name</label>
+    <input id="full-name" name="full name" type="text" maxlength="120" required />
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" maxlength="160" required />
+    <button id="to-step-2" type="button">Next</button>
+  </fieldset>
+
+  <fieldset id="step-2" data-step="2" hidden>
+    <legend>Step 2 of 3: eligibility</legend>
+    <label for="university">University</label>
+    <input id="university" name="university" type="text" maxlength="120" required />
+    <!-- Revealed by the script below once step one is complete, so an inspector that never advances cannot see it. -->
+    <div id="conditional" hidden>
+      <label for="work-auth">Do you require visa sponsorship?</label>
+      <select id="work-auth" name="do you require visa sponsorship" required>
+        <option value="">Choose one</option>
+        <option value="No">No</option>
+        <option value="Yes">Yes</option>
+      </select>
+    </div>
+    <button id="back-to-1" type="button">Back</button>
+    <button id="to-step-3" type="button">Next</button>
+  </fieldset>
+
+  <fieldset id="step-3" data-step="3" hidden>
+    <legend>Step 3 of 3: your interest</legend>
+    <label for="statement">Describe your research interests</label>
+    <textarea id="statement" name="describe your research interests" required></textarea>
+    <label for="cv">Upload your CV</label>
+    <input id="cv" name="cv" type="file" required />
+    <button id="back-to-2" type="button">Back</button>
+    <button id="submit" type="submit">Submit application</button>
+  </fieldset>
+</form>
+<script>
+  const show = (id) => { for (const f of document.querySelectorAll("fieldset")) f.hidden = f.id !== id; };
+  document.getElementById("to-step-2").addEventListener("click", () => {
+    show("step-2");
+    // The sponsorship question appears only after step one is filled, which is the dynamic-required case the worker has to notice.
+    document.getElementById("conditional").hidden = false;
+  });
+  document.getElementById("back-to-1").addEventListener("click", () => show("step-1"));
+  document.getElementById("to-step-3").addEventListener("click", () => show("step-3"));
+  document.getElementById("back-to-2").addEventListener("click", () => show("step-2"));
+</script>
+</body>
+</html>

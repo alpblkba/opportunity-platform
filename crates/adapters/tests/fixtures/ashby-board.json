@@ -1,0 +1,83 @@
+{
+  "apiVersion": "1",
+  "jobs": [
+    {
+      "id": "a0000000-0000-0000-0000-000000000001",
+      "title": "FPGA Research Assistant",
+      "department": "Hardware Engineering",
+      "team": "Emulation",
+      "employmentType": "FullTime",
+      "location": "Sunnyvale, CA",
+      "secondaryLocations": [],
+      "publishedAt": "2026-08-06T15:58:08.210+00:00",
+      "isListed": true,
+      "isRemote": false,
+      "workplaceType": "OnSite",
+      "address": {
+        "postalAddress": {
+          "postalCode": "94085",
+          "addressRegion": "California",
+          "streetAddress": "1 Example Way",
+          "addressCountry": "United States",
+          "addressLocality": "Sunnyvale"
+        }
+      },
+      "jobUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000001",
+      "applyUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000001/application",
+      "descriptionHtml": "<p>Maintain the FPGA emulation flow for our wafer-scale accelerator. Partition RTL, close timing and support pre-silicon software bring-up.</p>",
+      "descriptionPlain": "Maintain the FPGA emulation flow."
+    },
+    {
+      "id": "a0000000-0000-0000-0000-000000000002",
+      "title": "Compiler Engineer, Memory",
+      "department": "Software",
+      "team": "Compiler",
+      "employmentType": "FullTime",
+      "location": "Remote",
+      "secondaryLocations": [],
+      "publishedAt": "2026-09-11T10:00:00.000+00:00",
+      "isListed": true,
+      "isRemote": true,
+      "workplaceType": "Remote",
+      "jobUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000002",
+      "applyUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000002/application",
+      "descriptionHtml": "<p>Own scheduling and memory placement passes in our MLIR-based compiler for a wafer-scale dataflow engine.</p>",
+      "descriptionPlain": "Own scheduling and memory placement passes."
+    },
+    {
+      "id": "a0000000-0000-0000-0000-000000000003",
+      "title": "Hidden Draft Role",
+      "department": "Software",
+      "team": "Compiler",
+      "employmentType": "FullTime",
+      "location": "Remote",
+      "secondaryLocations": [],
+      "publishedAt": "2026-09-11T10:00:00.000+00:00",
+      "isListed": false,
+      "isRemote": true,
+      "workplaceType": "Remote",
+      "jobUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000003",
+      "applyUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000003/application",
+      "descriptionHtml": "<p>Not published.</p>",
+      "descriptionPlain": "Not published."
+    },
+    {
+      "id": "a0000000-0000-0000-0000-000000000004",
+      "title": "Platform Firmware Engineer",
+      "department": "Hardware Engineering",
+      "team": "Platform",
+      "employmentType": "FullTime",
+      "location": "Munich, Germany",
+      "secondaryLocations": [],
+      "publishedAt": "2026-10-01T08:00:00.000+00:00",
+      "isListed": true,
+      "isRemote": null,
+      "workplaceType": null,
+      "address": null,
+      "jobUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000004",
+      "applyUrl": "https://jobs.ashbyhq.com/examplewafer/a0000000-0000-0000-0000-000000000004/application",
+      "descriptionHtml": "<p>Own boot, power management and the memory controller bring-up firmware for the next platform generation.</p>",
+      "descriptionPlain": "Own boot and power management firmware."
+    }
+  ]
+}
