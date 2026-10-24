@@ -1,74 +1,143 @@
-name: repository hygiene and builds
+name: continuous integration
 
 on:
   push:
+    branches: [master]
   pull_request:
+    branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  security:
+    name: Repository security and privacy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate workflow syntax and expressions
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --max-time 60 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+      - name: Test verification failure handling
+        run: python3 -I scripts/test_ci.py
+      - name: Privacy regressions and Git index
+        run: |
+          python3 -I scripts/test_privacy.py
+          python3 -I scripts/check_privacy.py
+
+  rust:
+    name: Rust checks with PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     env:
-      DATABASE_URL: postgres://opportunity:opportunity@127.0.0.1:5432/opportunity_test
+      DATABASE_URL: postgres://opportunity_ci:synthetic_ci_only@127.0.0.1:5432/opportunity_ci
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: postgres:16-alpine
         ports:
           - 5432:5432
         env:
-          POSTGRES_USER: opportunity
-          POSTGRES_PASSWORD: opportunity
-          POSTGRES_DB: opportunity_test
+          POSTGRES_USER: opportunity_ci
+          POSTGRES_PASSWORD: synthetic_ci_only
+          POSTGRES_DB: opportunity_ci
         options: >-
-          --health-cmd "pg_isready -U opportunity -d opportunity_test"
+          --health-cmd "pg_isready -U opportunity_ci -d opportunity_ci"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy, rustfmt
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - name: Select declared Rust toolchain and components
+        run: |
+          rustup show active-toolchain
+          rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      # A Rust integration fixture spawns a fake worker with Node; it does not use Chromium.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
-      - name: Privacy and regression guard
+          package-manager-cache: false
+      - name: Make the DNS guard fixture deterministic
         run: |
-          python3 scripts/check_privacy.py
-          python3 scripts/test_privacy.py
-      - name: Rust format, lint and tests (once workspace exists)
-        shell: bash
+          echo '127.0.0.1 localtest.me' | sudo tee -a /etc/hosts >/dev/null
+          getent hosts localtest.me | grep -q '^127\.0\.0\.1[[:space:]]'
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy with locked dependencies
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Workspace tests including PostgreSQL and HTTP security
         run: |
-          if [[ -f Cargo.toml ]]; then
-            cargo fmt --all -- --check
-            cargo clippy --workspace --all-targets -- -D warnings
-            cargo test --workspace
-          else
-            echo 'No Cargo workspace yet, Rust code not implemented.'
-          fi
-      - name: Frontend checks (once app exists)
-        shell: bash
+          : "${DATABASE_URL:?PostgreSQL integration tests require DATABASE_URL}"
+          unset ALLOW_SKIP_DB_TESTS
+          cargo test --locked --workspace
+      - name: Verify test database cleanup
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         run: |
-          if [[ -f apps/web/package.json ]]; then
-            cd apps/web
-            npm ci
-            npm run typecheck
-            npm run build
-            npm test
-          else
-            echo 'Frontend not yet implemented.'
-          fi
-      - name: Browser worker checks (once app exists)
-        shell: bash
-        run: |
-          if [[ -f apps/browser-worker/package.json ]]; then
-            cd apps/browser-worker
-            npm ci
-            npm run typecheck
-            npx playwright install --with-deps chromium
-            npm test
-          else
-            echo 'Browser worker not yet implemented.'
-          fi
+          remaining="$(docker exec "$POSTGRES_CONTAINER" psql -U opportunity_ci -d postgres -v ON_ERROR_STOP=1 -Atc \
+            "select count(*) from pg_database where datname ~ '^opportunity_(auth|app|test)_[0-9a-f]{32}$'")"
+          [[ "$remaining" == 0 ]] || { echo "Integration tests left temporary databases behind" >&2; exit 1; }
+
+  frontend:
+    name: Frontend validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test -- --passWithNoTests=false
+      - run: npm run build
+
+  worker:
+    name: Browser-worker validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/browser-worker/package-lock.json
+      - run: npm ci
+        working-directory: apps/browser-worker
+      - name: Install Chromium and its OS dependencies
+        run: npx --no-install playwright install --with-deps --only-shell chromium
+        working-directory: apps/browser-worker
+      - name: Typecheck, compile and execute worker tests
+        run: bash scripts/verify-browser-worker.sh
