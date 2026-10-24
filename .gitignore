@@ -54,3 +54,28 @@ __pycache__/
 *.pyc
 # Agent plugin preferences are local to the developer's machine.
 .claude/
+
+# Local agent instructions and state.
+/Self-Docs/
+/self-docs/
+/.claude/
+/.codex/
+/.cursor/
+/AGENTS.md
+/CLAUDE.md
+
+# Internal development documents.
+/prompts/
+/BUILD_FULL_PRODUCT.md
+/ONE_PROMPT_FOR_CLAUDE.txt
+/SESSION_PLAN.md
+/SCOPE_LOCK.md
+/ACCEPTANCE_MATRIX.md
+/PROGRESS.md
+/RELEASE_VALIDATION.md
+/RUNBOOK.md
+
+# Internal reviews and deployment records.
+/docs/PRE_COMMIT_REVIEW.md
+/docs/GCP_DEPLOYMENT.md
+/docs/E2_MICRO_AUDIT.md
