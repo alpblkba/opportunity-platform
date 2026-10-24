@@ -1,8 +1,15 @@
-# Local personal data (including EPOCH-style local agent traces)
+# Local personal data (including EPOCH-style local agent traces).
+#
+# Both forms on purpose: /private/ is the one at the root, and **/private/ catches the ones a
+# component writes beside itself. apps/browser-worker/private/browser holds screenshots of filled
+# forms - raw browser artifacts, which the contract keeps out of Git - and the root-anchored rule
+# alone would have committed them.
 /private/
+**/private/
 .env
 .env.*
 !.env.example
+!.env.prod.example
 /target/
 /node_modules/
 **/node_modules/
@@ -12,6 +19,8 @@
 *.sqlite3
 *.db
 *.dump
+# Backup output: the dumps hold the CV and the application history, and their checksums are no use without them.
+/backups/
 *.pem
 *.key
 *.p12
@@ -29,6 +38,19 @@
 !**/tests/fixtures/**/*.pdf
 !**/tests/fixtures/*.docx
 !**/tests/fixtures/*.pdf
+# Downloaded third-party tooling. The gcloud CLI is 52 MB compressed and 396 MB extracted; it is
+# installed on a machine, not carried in a repository, and `git add -A` would otherwise take it.
+/google-cloud-sdk/
+google-cloud-cli-*.tar.gz
+google-cloud-cli-*.zip
+# Release archives built by scripts/release-image.sh. Regenerable, and hundreds of megabytes each.
+/dist/
+# macOS resource forks, written whenever this tree is copied to a non-APFS volume or archived.
+._*
+.AppleDouble/
+
 .DS_Store
 __pycache__/
 *.pyc
+# Agent plugin preferences are local to the developer's machine.
+.claude/

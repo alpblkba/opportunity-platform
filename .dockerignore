@@ -1,0 +1,52 @@
+# What never belongs in a build context.
+#
+# Nothing in the Dockerfile copies these, but the whole context is handed to the daemon before any COPY is evaluated: 13 GB of build output was being sent to build a 176 MB image, and the owner's CV and database dumps were going with it.
+
+# Personal data and local evidence, wherever a component wrote it.
+private/
+**/private/
+backups/
+*.dump
+*.dump.sha256
+
+# Secrets.
+.env
+.env.*
+!.env.example
+!.env.prod.example
+*.pem
+*.key
+
+# Downloaded tooling and release archives. 450 MB of gcloud CLI and every image tarball ever built
+# would otherwise be handed to the daemon to build an image that uses none of it.
+google-cloud-sdk/
+google-cloud-cli-*.tar.gz
+google-cloud-cli-*.zip
+dist/
+
+# macOS resource forks.
+._*
+**/._*
+.AppleDouble/
+**/.AppleDouble/
+.DS_Store
+
+# Build output, rebuilt inside the image anyway.
+target/
+**/node_modules/
+**/dist/
+apps/web/dist/
+
+# History and tooling.
+.git/
+.github/
+.claude/
+.vscode/
+.idea/
+
+# Documentation and session material, none of which the image needs.
+docs/
+Self-Docs/
+prompts/
+*.md
+!README.md
