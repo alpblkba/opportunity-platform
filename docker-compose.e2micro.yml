@@ -1,0 +1,62 @@
+# Overlay for a 1 GiB host, such as a Google Compute Engine e2-micro.
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.e2micro.yml --env-file .env.prod up -d
+#
+# It changes nothing about what the application does. It changes what it is allowed to consume, and it drops the one capability that does not fit: there is no browser in this profile, so every application is a manual handoff to the employer's own page. Everything else, including discovery, ranking, the review queue, dossiers and the standing-authorization rules, runs exactly as it does anywhere else.
+#
+# The budget, against 1 GiB of physical memory:
+#   ~250 MiB  Linux, the Docker daemon and the filesystem cache, which is not optional and is not free
+#    192 MiB  PostgreSQL
+#    256 MiB  the application
+#     64 MiB  the Cloudflare tunnel
+#   ~250 MiB  headroom, because a limit reached is a container killed
+#
+# A machine this size has no room for a second instance of anything, so the replica pin in the base file matters here as more than a nicety.
+
+services:
+  db:
+    # pgvector is never created by any migration: embeddings are stored as a plain real[] and search is a built-in tsvector. The stock image is 239 MB smaller for identical behaviour, and both carry pgcrypto, which the schema does use.
+    image: postgres:16-alpine
+    # Tuned for one user on a small machine rather than for a server with memory to spare. shared_buffers is the single biggest lever: the default 128 MB is a quarter of this machine.
+    command:
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - max_connections=12
+      - -c
+      - max_parallel_workers_per_gather=0
+      - -c
+      - jit=off
+      # Writing less often costs a little recovery time after a crash and saves steady background I/O on a shared-core machine.
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - max_wal_size=512MB
+    deploy:
+      resources:
+        limits:
+          memory: 192m
+
+  app:
+    # This machine runs images; it never compiles one. 1 GiB and a quarter of a shared core cannot build Rust and Vite, and should not have to: build on a machine with a toolchain, push or `docker save | docker load`, and set APP_IMAGE.
+    image: ${APP_IMAGE:-opportunity-app:latest}
+    pull_policy: never
+    environment:
+      # Four backends is enough for one person browsing while a refresh runs, and each one the server does not have to fork is several megabytes it keeps.
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-4}
+      # The whole shortlist is held in memory with its descriptions while it is scored. At roughly 4 KB of text per opportunity, 2000 is about 10 MB; raising it raises that in proportion. When the catalogue outgrows it the ranking says so rather than quietly scoring a subset.
+      MATCH_SHORTLIST: ${MATCH_SHORTLIST:-2000}
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  tunnel:
+    deploy:
+      resources:
+        limits:
+          memory: 64m

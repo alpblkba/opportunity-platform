@@ -1,0 +1,83 @@
+# Production deployment for a single small Linux host.
+#
+# Three services, no more: the modular monolith (API, scheduler and frontend in one process), PostgreSQL, and a Cloudflare tunnel. Splitting these would add operational surface without buying anything, and the browser worker is spawned per task rather than left running.
+#
+# Nothing publishes a port. The tunnel makes an outbound connection to Cloudflare, so the host needs no inbound firewall rule and the origin has no address an attacker can reach directly. That is what makes "the origin cannot be reached through an unprotected route" true rather than a configuration convention.
+
+name: opportunity
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env.prod}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.prod}
+      POSTGRES_DB: ${POSTGRES_DB:-opportunity}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # Deliberately no ports block. PostgreSQL is reachable only on the internal compose network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-opportunity}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    networks: [internal]
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-opportunity}
+      API_HOST: 0.0.0.0
+      API_PORT: 8787
+      # Binding a non-loopback address without an identity layer is refused at startup, so these three are effectively mandatory here.
+      ACCESS_MODE: ${ACCESS_MODE:-cloudflare}
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:-}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:-}
+      ACCESS_ALLOWED_EMAILS: ${ACCESS_ALLOWED_EMAILS:-}
+      # Absent by default. Without a provider the matcher runs lexically and says so; it never pretends a model ran.
+      EMBEDDINGS_PROVIDER: ${EMBEDDINGS_PROVIDER:-disabled}
+      EMBEDDINGS_ENDPOINT: ${EMBEDDINGS_ENDPOINT:-}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - private:/app/private
+    # Exactly one app container runs the scheduler. Scaling this service would start a second refresh loop against the same rows, so it is pinned to one replica.
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 1g
+    networks: [internal]
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    # The token names the tunnel and its route. It is a secret and lives only in .env.prod, never in this file or the repository.
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env.prod}
+    depends_on:
+      - app
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    networks: [internal]
+
+volumes:
+  db-data:
+  # The CV, browser screenshots and raw source snapshots. Backed up separately from the database.
+  private:
+
+networks:
+  internal:
+    driver: bridge
