@@ -84,7 +84,7 @@ jobs:
       - name: Make the DNS guard fixture deterministic
         run: |
           echo '127.0.0.1 localtest.me' | sudo tee -a /etc/hosts >/dev/null
-          getent hosts localtest.me | grep -q '^127\.0\.0\.1[[:space:]]'
+          getent ahostsv4 localtest.me | awk '$1 == "127.0.0.1" { found=1 } END { exit !found }'
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Clippy with locked dependencies
