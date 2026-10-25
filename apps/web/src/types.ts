@@ -281,6 +281,15 @@ export interface Vocabulary {
   job_kinds: string[];
 }
 
+export interface CvDocument {
+  id: string;
+  label: string;
+  version: number;
+  byte_size: number;
+  media_type: string;
+  created_at: string;
+}
+
 export interface ApplicationRecord {
   id: string;
   opportunity_id: string;

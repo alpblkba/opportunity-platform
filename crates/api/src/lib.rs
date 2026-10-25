@@ -3,6 +3,7 @@
 pub mod access;
 pub mod applications;
 pub mod auth;
+pub mod documents;
 pub mod error;
 pub mod personalization;
 pub mod routes;

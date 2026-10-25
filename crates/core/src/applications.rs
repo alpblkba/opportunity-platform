@@ -229,6 +229,50 @@ pub async fn set_status(
     Ok(row)
 }
 
+pub async fn update_tracking(
+    pool: &Db,
+    id: Uuid,
+    status: &str,
+    notes: &str,
+) -> Result<Application, AppError> {
+    if !matches!(
+        status,
+        "saved" | "submitted" | "interview" | "rejected" | "withdrawn"
+    ) {
+        return Err(AppError::Invalid(
+            "Choose saved, submitted, interview, rejected or withdrawn.".into(),
+        ));
+    }
+    if notes.len() > 20_000 {
+        return Err(AppError::Invalid(
+            "Notes must be at most 20000 bytes.".into(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let current: String =
+        sqlx::query_scalar("select status from applications where id=$1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound(id))?;
+    if matches!(current.as_str(), "preparing" | "submitting") {
+        return Err(AppError::Invalid(
+            "Wait for the active operation to finish before changing tracking.".into(),
+        ));
+    }
+    sqlx::query("update applications set status=$2, notes=$3, updated_at=now() where id=$1")
+        .bind(id)
+        .bind(status)
+        .bind(notes)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("insert into application_events (application_id, kind, detail) values ($1,'manual_tracking',$2)")
+        .bind(id).bind(serde_json::json!({"status":status,"notes":notes,"reported_by":"owner","submission_performed":false}))
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    get_application(pool, id).await
+}
+
 pub async fn set_route(pool: &Db, id: Uuid, route: Route, reason: &str) -> Result<(), AppError> {
     sqlx::query(
         "update applications set route = $2, route_reason = $3, updated_at = now() where id = $1",

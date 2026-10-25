@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api";
+import ApplicationTracking from "./ApplicationTracking";
 import { formatDate, relativeAge } from "../format";
 import type { ApplicantFact, ApplicationEvent, ApplicationRecord, Attempt, AuthorizationPolicy, ReviewTask } from "../types";
 
@@ -11,7 +12,7 @@ const STATUS_MEANING: Record<string, string> = {
   needs_review: "Waiting on you: some questions need answers.",
   ready: "Every field maps to something you approved. Not submitted.",
   submitting: "Being submitted right now.",
-  submitted: "Submitted, with a receipt from the employer's form.",
+  submitted: "Recorded as applied. History distinguishes manual reports from employer receipts.",
   submission_unknown: "Submitted but unconfirmed. Nobody knows whether it arrived.",
   interview: "You have an interview.",
   rejected: "Rejected.",
@@ -201,6 +202,10 @@ function ApplicationsPanel() {
       <ul className="cards">
         {applications.map((application) => (
           <li className="card" key={application.id}>
+            <ApplicationTracking application={application} onSaved={(updated) => {
+              setApplications((current) => current.map((item) => item.id === updated.id ? updated : item));
+              setExpanded(null);
+            }} />
             <h3>
               <span className={`badge ${STATUS_TONE[application.status] ?? ""}`}>
                 {application.status.replace(/_/g, " ")}

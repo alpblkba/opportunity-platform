@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api";
+import SaveApplicationButton from "./SaveApplicationButton";
 import { deadlineLabel, formatDate, kindLabel, locationLabel, relativeAge, stateLabel, isAdvertisedVacancy } from "../format";
 import type { Digest, MatchPage, Profile, ScoredOpportunity } from "../types";
 
@@ -251,6 +252,7 @@ function MatchCard({
       )}
 
       <div className="actions">
+        <SaveApplicationButton opportunityId={item.id} profileId={profileId} />
         {item.apply_url ? (
           <a className="badge" href={item.apply_url} target="_blank" rel="noopener noreferrer">
             Open employer posting

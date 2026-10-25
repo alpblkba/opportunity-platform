@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod digest;
+pub mod documents;
 pub mod embeddings;
 pub mod ingest;
 pub mod matching;

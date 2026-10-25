@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
             get(list_applications).post(create_application),
         )
         .route("/applications/{id}", get(get_application))
+        .route("/applications/{id}/tracking", post(update_tracking))
         .route("/applications/{id}/events", get(list_events))
         .route("/applications/{id}/attempts", get(list_attempts))
         .route("/applications/{id}/prepare", post(prepare))
@@ -114,6 +115,23 @@ async fn get_application(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Application>, ApiError> {
     Ok(Json(applications::get_application(&state.db, id).await?))
+}
+
+#[derive(Deserialize)]
+struct TrackingBody {
+    status: String,
+    #[serde(default)]
+    notes: String,
+}
+
+async fn update_tracking(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<TrackingBody>,
+) -> Result<Json<Application>, ApiError> {
+    Ok(Json(
+        applications::update_tracking(&state.db, id, &body.status, &body.notes).await?,
+    ))
 }
 
 async fn list_events(

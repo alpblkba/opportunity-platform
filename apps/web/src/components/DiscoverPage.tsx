@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api, emptyFilters, type DiscoverFilters } from "../api";
+import SaveApplicationButton from "./SaveApplicationButton";
 import { deadlineLabel, formatDate, isAdvertisedVacancy, kindLabel, locationLabel, orUnknown, relativeAge, stateLabel } from "../format";
 import type { Opportunity, OpportunityDetail, OpportunityPage, Source } from "../types";
 
@@ -215,6 +216,7 @@ function OpportunityCard({ opportunity }: { opportunity: Opportunity }) {
         )}
       </p>
       <div className="actions">
+        <SaveApplicationButton opportunityId={opportunity.id} />
         {opportunity.apply_url ? (
           <a className="badge" href={opportunity.apply_url} target="_blank" rel="noopener noreferrer">
             Open employer posting

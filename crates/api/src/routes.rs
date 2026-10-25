@@ -45,7 +45,8 @@ pub fn router(state: AppState) -> Router {
         .route("/source-runs", get(list_source_runs))
         .route("/refresh", post(refresh_all))
         .merge(crate::personalization::router())
-        .merge(crate::applications::router());
+        .merge(crate::applications::router())
+        .merge(crate::documents::router());
 
     // Everything under /api touches personal data, so the identity check wraps all of it in one place rather than route by route, where one forgotten route would be a leak.
     let api = api.route_layer(axum::middleware::from_fn_with_state(

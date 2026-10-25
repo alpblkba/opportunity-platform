@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { api } from "../api";
+import CvPanel from "./CvPanel";
 import type { Profile, RemotePolicy, Rule, SeniorityPolicy, Vocabulary } from "../types";
 
 const REMOTE_POLICIES: { value: RemotePolicy; label: string }[] = [
@@ -88,6 +89,7 @@ export default function ProfilesPage({ onChanged }: { onChanged: () => void }) {
   return (
     <section aria-labelledby="profiles-heading">
       <h2 id="profiles-heading">Profiles and rules</h2>
+      <CvPanel />
       <p className="notice">
         A profile is what you are looking for. Everything here stays on this machine: your location, work authorization
         and education are used only to decide eligibility and are never sent to a model or published.

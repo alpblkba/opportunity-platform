@@ -1,5 +1,6 @@
 import type {
   ApplicantFact,
+  CvDocument,
   ApplicationEvent,
   ApplicationRecord,
   Attempt,
@@ -129,6 +130,13 @@ export const api = {
   refreshAll: () =>
     request<{ sources_attempted: number; summaries: IngestSummary[] }>("/api/refresh?all=true", { method: "POST" }),
   sourceRuns: () => request<SourceRun[]>("/api/source-runs?limit=50"),
+
+  cvs: () => request<CvDocument[]>("/api/documents/cv"),
+  uploadCv: (file: File) => request<CvDocument>(`/api/documents/cv?filename=${encodeURIComponent(file.name)}`, {
+    method: "POST", headers: { "content-type": file.type || "application/octet-stream" }, body: file,
+  }),
+  updateTracking: (id: string, status: string, notes: string) =>
+    request<ApplicationRecord>(`/api/applications/${id}/tracking`, { method: "POST", body: JSON.stringify({ status, notes }) }),
 
   profiles: () => request<Profile[]>("/api/profiles"),
   createProfile: (body: unknown) => request<Profile>("/api/profiles", { method: "POST", body: JSON.stringify(body) }),

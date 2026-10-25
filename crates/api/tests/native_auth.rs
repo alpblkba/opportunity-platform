@@ -932,3 +932,147 @@ async fn a_second_account_cannot_be_created_while_isolation_is_unproven() {
     assert!(extra_user.is_err(), "additional accounts must be refused");
     server.cleanup().await;
 }
+
+#[tokio::test]
+async fn cv_upload_download_and_versions_work_with_native_and_cloudflare_identity() {
+    for mode in [
+        AccessMode::Native,
+        AccessMode::Cloudflare(cloudflare_access().await),
+    ] {
+        let native = matches!(mode, AccessMode::Native);
+        let server = server!(mode);
+        server.owner().await;
+        let header = if native {
+            (
+                "cookie",
+                TestServer::cookie_from(&server.login("owner@example.test", PASSWORD).await)
+                    .unwrap(),
+            )
+        } else {
+            (
+                "cf-access-jwt-assertion",
+                assertion("owner@example.test", chrono::Duration::hours(1)),
+            )
+        };
+        let url = format!("{}/api/documents/cv?filename=synthetic-cv.pdf", server.base);
+        let bytes = b"%PDF-1.4\nSynthetic CV fixture, no personal data.\n%%EOF";
+        assert_eq!(
+            server
+                .client
+                .post(&url)
+                .body(bytes.to_vec())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            server
+                .client
+                .post(&url)
+                .header(header.0, &header.1)
+                .header("origin", "https://other.example.test")
+                .body(bytes.to_vec())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        let mut ids = Vec::new();
+        for version in [1, 2] {
+            let response = server
+                .client
+                .post(&url)
+                .header(header.0, &header.1)
+                .header("origin", &server.base)
+                .body(bytes.to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 201);
+            let doc: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(doc["version"], version);
+            assert!(doc.get("file_path").is_none());
+            let id = doc["id"].as_str().unwrap().to_owned();
+            ids.push(id.clone());
+            let download_url = format!("{}/api/documents/{id}/download", server.base);
+            assert_eq!(
+                server
+                    .client
+                    .get(&download_url)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401
+            );
+            let response = server
+                .client
+                .get(&download_url)
+                .header(header.0, &header.1)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(response.headers()["content-disposition"]
+                .to_str()
+                .unwrap()
+                .contains(".pdf"));
+            assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
+            let path: String = sqlx::query_scalar("select file_path from documents where id=$1")
+                .bind(Uuid::parse_str(&id).unwrap())
+                .fetch_one(&server.pool)
+                .await
+                .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                    0
+                );
+            }
+        }
+        for (filename, body, expected) in [
+            ("../escape.pdf", bytes.to_vec(), 400),
+            ("fake.pdf", b"not a PDF".to_vec(), 400),
+            ("empty.txt", Vec::new(), 400),
+            ("large.txt", vec![b'x'; 5 * 1024 * 1024 + 1], 413),
+        ] {
+            let response = server
+                .client
+                .post(format!("{}/api/documents/cv", server.base))
+                .query(&[("filename", filename)])
+                .header(header.0, &header.1)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected);
+        }
+        let list = server
+            .send_with(
+                reqwest::Method::GET,
+                "/api/documents/cv",
+                &[(header.0, header.1.as_str())],
+                None,
+            )
+            .await;
+        assert_eq!(
+            list.json::<Vec<serde_json::Value>>().await.unwrap().len(),
+            2
+        );
+        for id in ids {
+            let path: String = sqlx::query_scalar("select file_path from documents where id=$1")
+                .bind(Uuid::parse_str(&id).unwrap())
+                .fetch_one(&server.pool)
+                .await
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+        server.cleanup().await;
+    }
+}

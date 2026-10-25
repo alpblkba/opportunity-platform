@@ -1473,3 +1473,59 @@ async fn dead_worker_payload_hash(pool: &Db, application_id: Uuid) -> String {
         .unwrap();
     workflow::payload_hash(&workflow::payload_for(&mapping))
 }
+
+#[tokio::test]
+async fn manual_tracking_persists_notes_and_owner_history_without_a_submission_attempt() {
+    let db = require_db!();
+    let opportunity = seed_opportunity(&db.pool, "Synthetic tracked role").await;
+    let app = applications::create_application(&db.pool, opportunity, None)
+        .await
+        .unwrap();
+    let duplicate = applications::create_application(&db.pool, opportunity, None)
+        .await
+        .unwrap();
+    assert_eq!(app.id, duplicate.id);
+    let updated = applications::update_tracking(
+        &db.pool,
+        app.id,
+        "submitted",
+        "Applied on employer website myself",
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.status, "submitted");
+    assert_eq!(
+        updated.notes.as_deref(),
+        Some("Applied on employer website myself")
+    );
+    let events = applications::list_events(&db.pool, app.id).await.unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.kind == "manual_tracking")
+        .unwrap();
+    assert_eq!(event.detail["reported_by"], "owner");
+    assert_eq!(event.detail["submission_performed"], false);
+    assert!(applications::list_attempts(&db.pool, app.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        applications::update_tracking(&db.pool, app.id, "submitting", "")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        applications::get_application(&db.pool, app.id)
+            .await
+            .unwrap()
+            .status,
+        "submitted"
+    );
+    applications::set_status(&db.pool, app.id, "submitting", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(applications::update_tracking(&db.pool, app.id, "saved", "")
+        .await
+        .is_err());
+    db.cleanup().await;
+}
