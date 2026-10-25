@@ -6,39 +6,37 @@
 # plus a checksum.
 #
 #   ./scripts/release-image.sh                 # linux/amd64, runtime target, no browser
-#   PLATFORM=linux/arm64 ./scripts/release-image.sh
-#   TARGET=browser ./scripts/release-image.sh   # the browser-capable image, which the 1 GiB
-#                                               # profile does not use
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 PLATFORM="${PLATFORM:-linux/amd64}"
 TARGET="${TARGET:-runtime}"
+[[ "$PLATFORM" == linux/amd64 && "$TARGET" == runtime ]] || { echo 'Production releases require linux/amd64 and target runtime' >&2; exit 1; }
+REVISION="$(git rev-parse HEAD)"
+[[ "${REVIEWED_SHA:-}" == "$REVISION" && "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'Set REVIEWED_SHA to the complete reviewed HEAD' >&2; exit 1; }
+[[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo 'Production image creation requires a clean reviewed checkout' >&2; exit 1; }
+[[ "${VERSION:-$REVISION}" == "$REVISION" ]] || { echo 'VERSION must equal REVIEWED_SHA' >&2; exit 1; }
+BUILD_LOCK="${TMPDIR:-/tmp}/opportunity-image-${REVISION}.lock"
+umask 077
+mkdir "$BUILD_LOCK" || { echo 'A build lock exists for this revision; inspect it before retrying' >&2; exit 1; }
+trap 'rmdir "$BUILD_LOCK"' EXIT
 OUT_DIR="${RELEASE_DIR:-dist}"
-ARCH="${PLATFORM##*/}"
-
-# The version is what a rollback asks for by name, so two builds must never answer to the same name.
-#
-# A commit alone cannot do that here: this repository is deliberately not committed between builds,
-# so several images would share one revision and a rollback would land on whichever was loaded last.
-# The timestamp makes every build distinct; the revision says what it came from; `dirty` says the
-# tree had changes that no revision describes. Nothing requires a commit.
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
-if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null \
-   || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-  REVISION="${REVISION}-dirty"
+ARCH=amd64
+TAG="opportunity-app:${REVISION}-amd64"
+ARCHIVE="${OUT_DIR}/opportunity-app-${REVISION}-amd64.tar.gz"
+if docker image inspect "$TAG" >/dev/null 2>&1 || [[ -e "$ARCHIVE" || -e "${ARCHIVE}.sha256" ]]; then
+  echo 'Release tag or archive already exists; do not replace a reviewed artifact' >&2
+  exit 1
 fi
-VERSION="${VERSION:-${STAMP}-${REVISION}}"
-TAG="opportunity-app:${VERSION}-${ARCH}"
-if [[ "$TARGET" != "runtime" ]]; then
-  TAG="opportunity-app:${VERSION}-${TARGET}-${ARCH}"
-fi
-ARCHIVE="${OUT_DIR}/$(echo "$TAG" | tr ':/' '--').tar.gz"
 
 echo "building ${TAG} for ${PLATFORM} (target: ${TARGET})"
-docker buildx build --platform "$PLATFORM" --target "$TARGET" -t "$TAG" --load .
+docker buildx build --platform linux/amd64 --target runtime --provenance=false --sbom=false \
+  --build-arg "GIT_REVISION=$REVISION" -t "$TAG" --load .
+[[ -z "$(git status --porcelain --untracked-files=all)" && "$(git rev-parse HEAD)" == "$REVISION" ]] || { echo 'Checkout changed during build; discard this artifact' >&2; exit 1; }
+[[ "$(docker image inspect "$TAG" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" == "$REVISION" ]] || { echo 'Wrong built revision' >&2; exit 1; }
+
+BUILT_ID="$(docker image inspect "$TAG" --format '{{.Id}}')"
 
 # What the image claims and what it is have to agree, because the wrong architecture fails on the
 # far side of a slow transfer rather than here.
@@ -65,6 +63,12 @@ if command -v shasum >/dev/null; then
 else
   sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
 fi
+
+ARTIFACT="$(python3 scripts/release-artifact.py "$ARCHIVE" --revision "$REVISION")"
+read -r verified_tag identities checksum <<< "$ARTIFACT"
+[[ "$verified_tag" == "$TAG" && ",$identities," == *",$BUILT_ID,"* \
+   && "$(docker image inspect "$TAG" --format '{{.Id}}')" == "$BUILT_ID" ]] || { echo 'Built and packaged image identities differ' >&2; exit 1; }
+printf '%s\n' "$ARTIFACT"
 
 extracted="$(docker image inspect "$TAG" --format '{{.Size}}')"
 printf '\n%s\n' "ready to ship:"

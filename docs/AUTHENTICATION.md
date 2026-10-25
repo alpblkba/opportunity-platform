@@ -145,7 +145,7 @@ The public landing page at `/` is part of what this opens: it is served to anyon
 
 The order below is not a suggestion. `vm-check.sh` fails a deployment in `both` or `native` mode when no account exists, which is correct: a login page nobody can get past is a broken release, so the account has to exist before the mode changes. This order was rehearsed on a local 1 GiB VM, not the production GCP instance.
 
-**Step 0 — deploy the new image, still in `cloudflare` mode.** Nothing about identity changes. The migration that adds `users` and `user_sessions` runs at startup and only adds tables, so the running configuration is unaffected by it.
+**Step 0 — deploy the new image, still in `cloudflare` mode.** Follow the owner's separately approved production rollout procedure only after its release gates close. Migration 0005 adds tables without changing existing records, but the older binary rejects the newer SQLx migration history; image rollback alone cannot recover this upgrade.
 
 ```bash
 ./scripts/deploy-vm.sh dist/opportunity-app-<tag>-amd64.tar.gz     # .env.prod still says cloudflare
@@ -176,7 +176,7 @@ sudo docker compose ... up -d --no-build app
 sh vm-check.sh          # must pass, and will refuse if no account exists
 ```
 
-**Step 3 — make the application the boundary.** Set `ACCESS_MODE=native` the same way. Still no Cloudflare change: Access is now asking for a code the application no longer needs, so the experience is an extra screen and nothing is weaker. `/`, `/login` and `/workspace` begin serving publicly at the origin while `/api/*` still answers 401, which `vm-check.sh` asserts. If anything is wrong, this step reverses by itself.
+**Step 3 — make the application the boundary.** Set `ACCESS_MODE=native` the same way. Still no Cloudflare change: Access is now asking for a code the application no longer needs, so the experience is an extra screen and nothing is weaker. `/`, `/login` and `/workspace` begin serving publicly at the origin while `/api/*` still answers 401, which `vm-check.sh` asserts. If a check fails, restore the previous access mode and recreate app while Access remains active.
 
 **Before step 4, confirm what is actually running.** `vm-check.sh` compares the `ACCESS_MODE` in the application container's own environment against the one in `.env.prod` and fails if they differ, because editing the file without restarting leaves the old mode serving. In `both` and `native` the unauthenticated status codes are identical, so the file alone cannot tell them apart — and the difference between them is whether Cloudflare Access is still required. Switching Access to Bypass while the application is still in `both` locks everyone out; doing it while the file *says* `native` and the container is still on `cloudflare` opens the hostname with no native gate behind it. This check is the thing that catches both, and it is mandatory before the policy changes.
 
@@ -184,7 +184,7 @@ sh vm-check.sh          # must pass, and will refuse if no account exists
 sh vm-check.sh        # must print: the container is running ACCESS_MODE=native, which is what .env.prod says
 ```
 
-**Step 4 — stop Access enforcing.** In Zero Trust, on the application covering `opportunities.alpblkba.dev`, replace the owner-only Allow policy with a single **Bypass / Everyone** policy. Do not keep both: Bypass is evaluated first and the Allow would never be reached, so leaving it would be a comforting no-op.
+**Step 4 — separate owner-authorized policy change, outside the release runbook.** In Zero Trust, on the application covering `opportunities.alpblkba.dev`, replace the owner-only Allow policy with a single **Bypass / Everyone** policy. Do not keep both: Bypass is evaluated first and the Allow would never be reached, so leaving it would be a comforting no-op.
 
 Keep the application object itself rather than deleting it. It holds the audience tag, and putting the Allow policy back is then one change rather than a rebuild.
 
@@ -199,11 +199,11 @@ Keep the application object itself rather than deleting it. It holds the audienc
 | Step 4 opened too much | Replace the Bypass policy with the owner-only Allow. Effective immediately; no deployment. |
 | Native login misbehaves after step 4 | Allow policy back first, then `ACCESS_MODE=cloudflare` and restart. Order matters: restore Access before removing the application's own gate, never the other way round. |
 | Step 2 or 3 misbehaves | `ACCESS_MODE=cloudflare`, restart. Cloudflare was never changed, so there is nothing to undo there. |
-| Step 0 misbehaves | `./scripts/deploy-vm.sh --rollback <previous tag>`, which the deployment also does by itself when the health check fails. |
+| Step 0 misbehaves | Follow the database recovery procedure in the owner's separately approved production rollout procedure; the pre-0005 binary requires a verified pre-upgrade restore. |
 
-Two things a rollback does not undo. **Migrations** ran at startup and are not reversed; the schema after `0005` is readable by the older binary (it only adds tables), but a future migration may not be, which is what the pre-deployment backup is for. **Cloudflare policy** is never changed by the deployment script, so if a cutover step is being rolled back, the policy has to be put back by hand.
+Image rollback does not reverse migrations or change Cloudflare policy. Journal recovery restores its recorded image, environment and deployment files; a separate manual rollback keeps the current authentication settings. The local preflight reproduced the older binary refusing to start after 0005 with “migration 5 was previously applied but is missing in the resolved migrations”. Preserve the migrated database and restore the verified pre-release backup into a new database for that recovery; never edit SQLx history to conceal the incompatibility. Keep Access active throughout this release; changing its policy requires separate owner authorization.
 
-`scripts/deploy-vm.sh` now fails the release and rolls the image back automatically when `vm-check.sh` fails, and says both of those things on the way out.
+`scripts/deploy-vm.sh` fails a bad release. After mutation, exit 1 means previous image/configuration recovery passed complete verification; exit 2 means unresolved state or unproved recovery. A database restore remains a separate owner-authorized procedure.
 
 ## Acceptance, when the cutover is approved
 

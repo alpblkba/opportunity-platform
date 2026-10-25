@@ -23,6 +23,9 @@ COMPOSE="$D compose -f docker-compose.prod.yml -f docker-compose.e2micro.yml --e
 APP="$($COMPOSE ps -q app 2>/dev/null | head -1)"
 DB="$($COMPOSE ps -q db 2>/dev/null | head -1)"
 problems=0
+VM_READY_TIMEOUT="${VM_READY_TIMEOUT:-60}"
+case "$VM_READY_TIMEOUT" in ''|*[!0-9]*) echo 'VM_READY_TIMEOUT must be 1..120 seconds' >&2; exit 1;; esac
+[ "$VM_READY_TIMEOUT" -ge 1 ] && [ "$VM_READY_TIMEOUT" -le 120 ] || exit 1
 
 # Read rather than source: this file holds the tunnel token and the database password, and nothing
 # here needs to execute it.
@@ -60,12 +63,36 @@ $COMPOSE ps --format '  {{.Service}}  {{.Status}}' 2>/dev/null || $COMPOSE ps
 [ -n "$APP" ] || fail "the application container is not running"
 [ -n "$DB" ] || fail "the database container is not running"
 
+# Wait before inspecting startup logs or account state; migration/startup may still be in progress.
+if [ -n "$APP" ]; then
+  deadline=$(( $(date +%s) + VM_READY_TIMEOUT ))
+  while :; do
+    health=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/health 2>/dev/null) || health=000
+    ready=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/ready 2>/dev/null) || ready=000
+    [ "$health" = 200 ] && [ "$ready" = 200 ] && break
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      fail "startup deadline expired: /health=${health}, /ready=${ready}"
+      break
+    fi
+    printf '  waiting for startup: /health=%s /ready=%s\n' "$health" "$ready"
+    sleep 1
+  done
+fi
+
 echo
 echo "== which image is running =="
 wanted="$(value_of APP_IMAGE)"
 running="$([ -n "$APP" ] && $D inspect "$APP" --format '{{.Config.Image}}' 2>/dev/null)"
 printf '  wanted  %s\n' "${wanted:-unset in .env.prod}"
 printf '  running %s\n' "${running:-nothing}"
+actual_id="$([ -n "$APP" ] && $D inspect "$APP" --format '{{.Image}}' 2>/dev/null)"
+if [ -n "${EXPECTED_IMAGE_ID:-}" ] && [ "$actual_id" != "$EXPECTED_IMAGE_ID" ]; then
+  fail "the running immutable image ID differs from the verified release"
+fi
+if [ -n "$wanted" ]; then
+  configured_id=$($D image inspect "$wanted" --format '{{.Id}}' 2>/dev/null)
+  [ -n "$actual_id" ] && [ "$configured_id" = "$actual_id" ] || fail "configured and running immutable image IDs differ"
+fi
 if [ -n "$wanted" ] && [ -n "$running" ] && [ "$wanted" != "$running" ]; then
   fail "the running container is not the image .env.prod names; a restart would change versions"
 fi
@@ -181,13 +208,15 @@ fi
 echo
 echo "== health and access (mode: ${MODE}) =="
 if [ -n "$APP" ]; then
-  health=$($D exec "$APP" curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/health 2>/dev/null)
+  health=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/health 2>/dev/null)
   [ "$health" = "200" ] && pass "/health answers 200" || fail "/health answered ${health:-nothing}"
+  ready=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/ready 2>/dev/null) || ready=000
+  [ "$ready" = "200" ] && pass "/ready answers 200" || fail "/ready answered ${ready:-nothing}"
 
   # True in every production mode: no private data without an identity. This is the check that
   # matters, and it does not vary.
   for path in /api/stats /api/applications /api/facts /api/profiles /api/auth/session; do
-    code=$($D exec "$APP" curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8787${path}" 2>/dev/null)
+    code=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:8787${path}" 2>/dev/null)
     if [ "$code" = "401" ]; then
       pass "${path} refuses an unauthenticated caller"
     else
@@ -197,8 +226,8 @@ if [ -n "$APP" ]; then
 
   # The interface itself differs by design. Where Cloudflare is the boundary it sits behind the
   # gate; where a native session is, the login page has to load before anyone can log in.
-  root=$($D exec "$APP" curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/ 2>/dev/null)
-  login=$($D exec "$APP" curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/login 2>/dev/null)
+  root=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/ 2>/dev/null)
+  login=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/login 2>/dev/null)
   case "$MODE" in
     cloudflare)
       [ "$root" = "401" ] && pass "/ stays behind Cloudflare Access" || fail "/ answered ${root:-nothing}, expected 401 in cloudflare mode"
@@ -208,11 +237,11 @@ if [ -n "$APP" ]; then
       [ "$root" = "200" ] && pass "/ serves the public landing page" || fail "/ answered ${root:-nothing}, expected 200 in ${MODE} mode"
       # A deep link into the private side is the same shell; what it shows is decided by the API,
       # which is checked above. What matters here is that it resolves rather than 404ing.
-      workspace=$($D exec "$APP" curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/workspace 2>/dev/null)
+      workspace=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/workspace 2>/dev/null)
       [ "$workspace" = "200" ] && pass "/workspace deep-links into the application" || fail "/workspace answered ${workspace:-nothing}"
       # The shell is public here, so it had better be a shell: one bundle, no data baked in.
       for path in / /login /workspace; do
-        body=$($D exec "$APP" curl -s "http://127.0.0.1:8787${path}" 2>/dev/null | head -c 8000)
+        body=$($D exec "$APP" curl -s --connect-timeout 2 --max-time 5 "http://127.0.0.1:8787${path}" 2>/dev/null | head -c 8000)
         case "$body" in
           *@*) fail "${path} contains an address; the public shell must carry no personal data" ;;
           *) pass "${path} carries no address" ;;

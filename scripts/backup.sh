@@ -3,6 +3,7 @@
 #
 # The dump is custom-format so it can be restored selectively and in parallel. The private tree holds the CV, raw source snapshots and browser screenshots, which are not in the database and would otherwise be lost.
 set -euo pipefail
+umask 077
 
 cd "$(dirname "$0")/.."
 
@@ -24,19 +25,25 @@ if [[ -z "$ENCRYPT_TO" && "$REQUIRE_ENCRYPTION" == "yes" ]]; then
   exit 1
 fi
 
+if [[ -n "$ENCRYPT_TO" ]]; then
+  # An encryption failure must not leave the plaintext backup behind.
+  trap 'rm -f "${OUT_DIR}/opportunity-${STAMP}.dump" "${OUT_DIR}/private-${STAMP}.tar.gz" "${OUT_DIR}/opportunity-${STAMP}.dump.gpg.tmp" "${OUT_DIR}/private-${STAMP}.tar.gz.gpg.tmp"' EXIT
+fi
+
 # Encrypt in place when a recipient is configured, and checksum whatever is actually going to be
 # copied off the machine, so verification on the far side checks the file that exists there.
 protect() {
   local file="$1"
   if [[ -n "$ENCRYPT_TO" ]]; then
-    gpg --batch --yes --trust-model always --encrypt --recipient "$ENCRYPT_TO" --output "${file}.gpg" "$file"
+    gpg --batch --yes --trust-model always --encrypt --recipient "$ENCRYPT_TO" --output "${file}.gpg.tmp" "$file" || return 1
+    mv "${file}.gpg.tmp" "${file}.gpg" || return 1
     shred -u "$file" 2>/dev/null || rm -f "$file"
     file="${file}.gpg"
   fi
   if command -v shasum >/dev/null; then
-    shasum -a 256 "$file" > "${file}.sha256"
+    shasum -a 256 "$file" > "${file}.sha256" || return 1
   else
-    sha256sum "$file" > "${file}.sha256"
+    sha256sum "$file" > "${file}.sha256" || return 1
   fi
   printf '%s' "$file"
 }
@@ -61,7 +68,8 @@ if compose ps --services 2>/dev/null | grep -q '^app$'; then
     protect "${OUT_DIR}/private-${STAMP}.tar.gz" > /dev/null
   else
     rm -f "${OUT_DIR}/private-${STAMP}.tar.gz"
-    echo "note: the private tree could not be archived from the app container; back it up from the host volume instead"
+    echo "The private tree could not be archived; the backup is incomplete." >&2
+    exit 1
   fi
 fi
 

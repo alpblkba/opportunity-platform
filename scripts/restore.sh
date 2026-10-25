@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 
 DUMP="${1:?usage: restore.sh <dump file> [target database]}"
 TARGET="${2:-opportunity_restore_rehearsal}"
+[[ "$TARGET" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && ${#TARGET} -le 63 ]] || { echo "target must be a PostgreSQL identifier of at most 63 characters" >&2; exit 1; }
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 ENV_FILE="${ENV_FILE:-.env.prod}"
 ALLOW_OVERWRITE="${ALLOW_OVERWRITE:-no}"
@@ -21,21 +22,24 @@ DB_USER="${POSTGRES_USER:-opportunity}"
 
 if [[ -f "${DUMP}.sha256" ]]; then
   echo "verifying the dump checksum"
-  if command -v shasum >/dev/null; then shasum -a 256 -c "${DUMP}.sha256"; else sha256sum -c "${DUMP}.sha256"; fi
+  read -r expected _ < "${DUMP}.sha256"
+  [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || { echo "invalid dump checksum" >&2; exit 1; }
+  if command -v shasum >/dev/null; then actual="$(shasum -a 256 "$DUMP")"; else actual="$(sha256sum "$DUMP")"; fi
+  [[ "${actual%% *}" == "$expected" ]] || { echo "dump checksum mismatch" >&2; exit 1; }
 fi
 
 # An encrypted dump is decrypted to a file only this user can read, for as long as the restore takes.
 PLAINTEXT="$DUMP"
 if [[ "$DUMP" == *.gpg ]]; then
   echo "decrypting"
-  PLAINTEXT="$(mktemp -t opportunity-restore)"
+  PLAINTEXT="$(mktemp "${TMPDIR:-/tmp}/opportunity-restore.XXXXXX")"
   chmod 600 "$PLAINTEXT"
   trap 'shred -u "$PLAINTEXT" 2>/dev/null || rm -f "$PLAINTEXT"' EXIT
   gpg --batch --yes --quiet --decrypt --output "$PLAINTEXT" "$DUMP"
 fi
 
 exists=$(compose exec -T db psql -U "$DB_USER" -d postgres -tAc \
-  "select 1 from pg_database where datname = '${TARGET}'" || true)
+  "select 1 from pg_database where datname = '${TARGET}'")
 if [[ "$exists" == "1" && "$ALLOW_OVERWRITE" != "yes" ]]; then
   echo "database '${TARGET}' already exists. Refusing to overwrite it." >&2
   echo "Rerun with ALLOW_OVERWRITE=yes only if you are certain, or choose a different target name." >&2
@@ -46,7 +50,7 @@ if [[ "$exists" == "1" ]]; then
   compose exec -T db psql -U "$DB_USER" -d postgres -c "drop database \"${TARGET}\" with (force)"
 fi
 compose exec -T db psql -U "$DB_USER" -d postgres -c "create database \"${TARGET}\""
-compose exec -T db pg_restore -U "$DB_USER" -d "$TARGET" --no-owner < "$PLAINTEXT"
+compose exec -T db pg_restore -U "$DB_USER" -d "$TARGET" --no-owner --single-transaction --exit-on-error < "$PLAINTEXT"
 
 echo
 echo "restored into '${TARGET}'. Row counts:"

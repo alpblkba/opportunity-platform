@@ -32,12 +32,15 @@ COPY crates/cli/Cargo.toml crates/cli/
 RUN mkdir -p crates/domain/src crates/adapters/src crates/core/src crates/api/src crates/cli/src \
     && echo "fn main() {}" > crates/cli/src/main.rs \
     && for c in domain adapters core api; do echo "" > crates/$c/src/lib.rs; done \
-    && cargo fetch
+    && cargo fetch --locked
 COPY crates ./crates
 COPY migrations ./migrations
-RUN cargo build --release --bin opportunity && strip target/release/opportunity
+RUN cargo build --locked --release --bin opportunity && strip target/release/opportunity
 
 FROM debian:bookworm-slim AS runtime
+ARG GIT_REVISION
+LABEL org.opencontainers.image.revision=$GIT_REVISION \
+      org.opencontainers.image.title="opportunity-runtime"
 # ca-certificates is needed to read job boards over TLS; curl is the health check.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

@@ -2,7 +2,7 @@
 
 This is a single-user private service holding a person's CV, their answers to application questions and the authority to submit applications. The deployment is shaped around that: nothing is published, the origin has no public address, and the application refuses to run in a configuration where personal data would be reachable without an identity check.
 
-Nothing in this document has been executed against a real host or a real Cloudflare account. Everything below was verified locally against the same image and the same access mode, with the tunnel omitted because starting one would expose the origin. The owner runs the steps that need credentials, billing or DNS.
+Use the owner's separately approved production rollout procedure for the existing Compute Engine release and the owner's private release assessment for current evidence and blockers. The general setup examples below do not authorize production work or an Access policy change. The preflight accessed no production host or Cloudflare account.
 
 ## What runs
 
@@ -16,15 +16,15 @@ The compose file publishes no ports at all. The only path in is the tunnel, whic
 
 The application refuses to start on a non-loopback address unless an identity layer is configured. `guard_bind_address` returns an error naming the exact environment variables to set, and the process exits. Binding `0.0.0.0` with `ACCESS_MODE=loopback` is impossible rather than discouraged.
 
-Every route under `/api`, and the interface itself, runs through one middleware that validates the Cloudflare Access assertion against the team's public keys, checks the audience and issuer, and compares the identity against an allowlist. An empty allowlist is refused at startup rather than meaning everyone. `/health` stays open so a container orchestrator can probe it; it returns a status and a version and nothing else.
+Private API routes require the configured identity: Cloudflare assertions in `cloudflare`, assertions and native sessions in `both`, or native sessions in `native`. Native and both modes serve public interface markup without personal data. An empty Cloudflare allowlist is refused when that identity layer is enabled. `/health` returns liveness and package version; `/ready` additionally checks a database query. Neither identifies the reviewed Git SHA.
 
 ## The machine this is going to
 
-`docs/GCP_DEPLOYMENT.md` is the runbook for the Compute Engine instance that already exists: what to build, how to get it there over IAP, what to check, how to roll back, and exactly what access that needs. The rest of this file is the general shape of the deployment and the providers it was sized against.
+The owner's separately approved production rollout procedure covers build identity, IAP transfer, encrypted off-host backup, isolated restoration, authentication stages and recovery. The rest of this file describes the general deployment shape; it is not the procedure for upgrading the existing VM.
 
 ## A 1 GiB host
 
-`docs/E2_MICRO_AUDIT.md` measures this deployment on a machine with 1 GiB of memory, such as a Google Compute Engine `e2-micro`, and `docker-compose.e2micro.yml` is the profile it measures:
+`docker-compose.e2micro.yml` sets the intended 256/192/64 MiB app/database/tunnel limits. The private release assessment distinguishes these limits from measurements; native amd64 validation on a 1 GiB host remains required. The combined profile is:
 
 ```bash
 docker compose -f docker-compose.prod.yml -f docker-compose.e2micro.yml --env-file .env.prod up -d
@@ -33,8 +33,8 @@ docker compose -f docker-compose.prod.yml -f docker-compose.e2micro.yml --env-fi
 It sets memory limits, tunes PostgreSQL for a small machine, uses the stock `postgres:16-alpine` image, and runs a prebuilt application image rather than building one — a machine that size cannot compile Rust and should not try. Build elsewhere and bring the image over:
 
 ```bash
-docker build -t opportunity-app:latest --target runtime .      # on a machine with a toolchain
-docker save opportunity-app:latest | ssh <host> docker load    # or push to a registry and pull
+REVIEWED_SHA="<reviewed-full-commit-sha>" ./scripts/release-image.sh
+# Transfer only after the owner approves provenance, off-host restore and recovery-point evidence.
 ```
 
 The browser is not in that profile. Source sweeps and browser runs are serialized against each other, which removes the failure that used to kill Chromium mid-form, but at the profile's 256 MiB application limit Chromium still has nowhere to run: measured, four attempts submitted nothing and the kernel killed it three times. Assisted application is therefore off there, the process says so at startup, and each application is handed back as a manual one.
@@ -78,10 +78,10 @@ Hetzner bills a flat monthly rate with no credit expiry, which makes it the simp
 
 ### Architectures
 
-The image is defined for both architectures and the Rust and Node toolchains it uses support both. **Only `linux/arm64` has actually been built and run**, on Apple Silicon. `linux/amd64` has not been built or started in this session and is therefore unverified. Before trusting an amd64 host, build it explicitly and check the container reaches a healthy state:
+The preflight built and ran the Linux amd64 runtime image under emulation on Apple Silicon, including database and authentication checks. Native amd64 execution and representative total-host memory on a 1 GiB machine remain untested. Explicitly select the runtime target: the Dockerfile also contains a browser stage that does not fit the e2-micro profile.
 
 ```bash
-docker buildx build --platform linux/amd64 -t opportunity-app:amd64 --load .
+docker buildx build --platform linux/amd64 --target runtime -t opportunity-app:amd64 --load .
 docker run --rm opportunity-app:amd64 --help
 ```
 
@@ -103,7 +103,7 @@ cd opportunity-platform
 cp .env.prod.example .env.prod
 ```
 
-Fill in `.env.prod`. Generate the database password with `openssl rand -base64 32`. `CF_ACCESS_TEAM_DOMAIN` is the team hostname such as `example.cloudflareaccess.com`. `CF_ACCESS_AUD` is the Application Audience tag on the Access application's overview page. `ACCESS_ALLOWED_EMAILS` is the owner's address. `CLOUDFLARE_TUNNEL_TOKEN` comes from the tunnel's install screen. `.env.prod` is git-ignored and must stay off the repository.
+Fill in `.env.prod`. Generate the database password with `openssl rand -hex 24`. `CF_ACCESS_TEAM_DOMAIN` is the team hostname such as `example.cloudflareaccess.com`. `CF_ACCESS_AUD` is the Application Audience tag on the Access application's overview page. `ACCESS_ALLOWED_EMAILS` is the owner's address. `CLOUDFLARE_TUNNEL_TOKEN` comes from the tunnel's install screen. `.env.prod` is git-ignored and must stay off the repository.
 
 In the Cloudflare tunnel, add a public hostname routing `opportunities.alpblkba.dev` to `http://app:8787`, and attach the Access application to that hostname.
 
@@ -134,7 +134,7 @@ Rehearsed locally on 2026-10-22: 1854 opportunities, 1905 postings, 14 sources, 
 
 `restore.sh` verifies the checksum first and refuses to overwrite an existing database unless `ALLOW_OVERWRITE=yes` is passed, because the usual reason to run it is a rehearsal and the usual disaster is pointing it at the live database. Rehearsed locally: restored into a disposable database, row counts matched, and both real databases were untouched.
 
-`scripts/backup.sh` writes to a named volume on the same machine, which protects against a mistaken `drop` and not against losing the host. The dumps contain the CV, the answers and the application history, so they must leave the host: a cron entry running `rsync` or `rclone` to storage elsewhere, encrypted at rest. Verify one occasionally by restoring it into a throwaway database. A backup nobody has restored is a hypothesis.
+`scripts/backup.sh` writes files under `BACKUP_DIR` (default `backups/`) on the same machine, which protects against a mistaken `drop` and not against losing the host. The dumps contain the CV, the answers and the application history, so they must leave the host: a cron entry running `rsync` or `rclone` to storage elsewhere, encrypted at rest. Verify one occasionally by restoring it into a throwaway database. A backup nobody has restored is a hypothesis.
 
 ## The scheduler
 
@@ -154,22 +154,9 @@ Live employer submission. The browser worker reaches loopback only; opening that
 
 ## Updating, rolling back and recovering
 
-An update is a pull and a rebuild. Compose replaces the application container and leaves the database and its volume alone.
+Follow the owner's separately approved production rollout procedure. Build the exact reviewed release elsewhere, retain the actual previous image, create encrypted database and private-file backups, copy them off-host and prove an isolated restore before migration. Do not build on the e2-micro or use `migrate-to-cloud.sh` to upgrade existing data.
 
-```bash
-./scripts/backup.sh                      # always, before an update
-git pull
-docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build app
-docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f app
-```
-
-Migrations run at startup and are applied in a transaction each, so a failed migration leaves the schema at the last good state and the container restarts rather than serving a half-migrated database.
-
-To roll back, check out the previous commit and rebuild the same way. A rollback across a migration that changed the schema is the one case needing the backup: restore the dump taken before the update into a fresh database and point `DATABASE_URL` at it, because an older binary will not understand a newer schema.
-
-If a deployment fails outright and the container will not stay up, `docker compose ... logs app` names the reason. The common causes are a missing or wrong `.env.prod` value, which the application refuses to start on rather than guessing, and an unreachable database, which it retries. Nothing is lost in either case: the volumes outlive the containers.
-
-Recovering a host from nothing: provision, install Docker, clone, write `.env.prod`, `up -d`, then `./scripts/restore.sh` the most recent dump into the live database with `ALLOW_OVERWRITE=yes`. The private tree is restored from its own archive. Budget twenty minutes, most of it the image build.
+Migrations run before the server binds, in transactions recorded by SQLx. Migration 0005 preserves legacy rows, but the older runtime refuses its unknown migration history. Automatic image recovery cannot reverse that history. Recovery to the pre-0005 binary requires a new database restored from the pre-release backup and the matching retained deployment files/checker; it must preserve the failed database for investigation. Do not edit migration history or overwrite the live database to bypass this gate.
 
 ## Known limitations
 
@@ -179,4 +166,4 @@ There is no rate limiting at the origin. Cloudflare Access is the only thing in 
 
 Off-host backup copying is a manual step the owner has to automate; nothing in this repository does it.
 
-`linux/amd64` is unverified, as described under Architectures.
+Linux amd64 execution was verified under emulation; native amd64 and 1 GiB capacity remain unverified, as described under Architectures.

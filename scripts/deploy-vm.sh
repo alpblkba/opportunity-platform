@@ -6,6 +6,7 @@
 #   ./scripts/deploy-vm.sh dist/opportunity-app-<tag>.tar.gz
 #   ./scripts/deploy-vm.sh --rollback opportunity-app:<previous tag>
 #   ./scripts/deploy-vm.sh --status
+#   ./scripts/deploy-vm.sh --reconcile                   # inspect and resolve a pending journal
 #
 # Transport is Google's IAP tunnel by default, which needs no public address on the VM and no open
 # firewall: the connection is authorized by IAM and tunnelled over Google's front end. Set
@@ -25,6 +26,7 @@ REMOTE_DIR="${REMOTE_DIR:-/opt/opportunity}"
 BOOTSTRAP_CONNECTOR="${BOOTSTRAP_CONNECTOR:-opportunity-tunnel-bootstrap}"
 DRY_RUN="no"
 MODE="deploy"
+RECONCILE_TOKEN="pending"
 ARCHIVE=""
 ROLLBACK_TAG=""
 # What the machine has to be. Taken from the archive's own name when there is one, so a rehearsal on
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --preflight) MODE="preflight"; shift ;;
     --rollback) MODE="rollback"; ROLLBACK_TAG="${2:?--rollback needs the image tag to go back to}"; shift 2 ;;
     --status) MODE="status"; shift ;;
+    --reconcile) MODE="reconcile"; shift; if [[ $# -gt 0 && "$1" != -* ]]; then RECONCILE_TOKEN="$1"; shift; fi ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) ARCHIVE="$1"; shift ;;
   esac
@@ -88,28 +91,6 @@ compose() {
   echo "\$D compose -f docker-compose.prod.yml -f docker-compose.e2micro.yml --env-file .env.prod $*"
 }
 
-# What the application container is actually running, which is the only answer that matters when
-# deciding what to go back to.
-running_image() {
-  { remote "${DOCKER_PRELUDE} \$D inspect -f '{{.Config.Image}}' \$(cd ${REMOTE_DIR} && $(compose ps -q app) 2>/dev/null | head -1) 2>/dev/null" 2>/dev/null | tr -d '\r\n' | tail -1; } || true
-}
-
-# What .env.prod names, for the case where nothing is running yet.
-configured_image() {
-  { remote "grep '^APP_IMAGE=' ${REMOTE_DIR}/.env.prod 2>/dev/null | cut -d= -f2-" 2>/dev/null | tr -d '\r\n' | tail -1; } || true
-}
-
-# Which image to run is written into .env.prod rather than exported into the command.
-#
-# sudo resets the environment, so `APP_IMAGE=x sudo docker compose` loses it and compose quietly
-# falls back to its default tag: the wrong version, started successfully, which is the worst kind of
-# failure. The env file crosses that boundary, and a reboot then brings back the same image rather
-# than whatever `latest` happens to be.
-set_app_image() {
-  local tag="$1"
-  remote "cd ${REMOTE_DIR} && if grep -q '^APP_IMAGE=' .env.prod; then sed -i 's|^APP_IMAGE=.*|APP_IMAGE=${tag}|' .env.prod; else printf 'APP_IMAGE=%s\\n' '${tag}' >> .env.prod; fi && grep '^APP_IMAGE=' .env.prod"
-}
-
 preflight() {
   local problems=0
   echo "== here =="
@@ -153,9 +134,9 @@ preflight() {
     # worse than finding it out now with an empty file.
     local probe
     probe="$(mktemp)"
-    if copy "$probe" "${REMOTE_DIR}/.scp-probe" >/dev/null 2>&1; then
+    if copy "$probe" "${REMOTE_DIR}/.scp-probe-${TOKEN}" >/dev/null 2>&1; then
       echo "  ok    scp over IAP works"
-      remote "rm -f ${REMOTE_DIR}/.scp-probe" >/dev/null 2>&1 || true
+      remote "rm -f ${REMOTE_DIR}/.scp-probe-${TOKEN}" >/dev/null 2>&1 || true
     else
       echo "  FAIL  scp over IAP failed; ssh works, so this is usually ${REMOTE_DIR} not being writable"
       problems=$((problems + 1))
@@ -173,6 +154,9 @@ preflight() {
     say() { printf '  %-5s %s\n' \"\$1\" \"\$2\"; }
     bad() { say FAIL \"\$1\"; problems=\$((problems + 1)); }
 
+    for tool in bash timeout flock sha256sum; do
+      command -v \"\$tool\" >/dev/null 2>&1 || bad \"missing required release tool: \$tool\"
+    done
     arch=\$(uname -m)
     if [ \"\$arch\" = ${EXPECTED_MACHINE} ]; then say ok \"architecture \$arch, which the image needs\"; else bad \"architecture \$arch, but the image is for ${EXPECTED_MACHINE}\"; fi
 
@@ -218,8 +202,8 @@ preflight() {
     fi
 
     stray=\$(\$D ps --filter name=${BOOTSTRAP_CONNECTOR} --format '{{.Names}}' 2>/dev/null)
-    if [ -n \"\$stray\" ]; then say note \"the bootstrap connector \$stray is running; deploying stops it so one connector runs, not two\"; fi
-    if systemctl is-active --quiet cloudflared 2>/dev/null; then say note 'a cloudflared systemd service is active; deploying stops and disables it'; fi
+    if [ -n \"\$stray\" ]; then bad 'a bootstrap connector is running; resolve it before release'; fi
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then bad 'a standalone cloudflared service is active; resolve it before release'; fi
 
     echo \"REMOTE_PROBLEMS=\$problems\"
   ")"
@@ -237,193 +221,96 @@ preflight() {
   return "$problems"
 }
 
-# Stop whatever connector was started by hand, so the one in the compose file is the only one.
-retire_bootstrap_connector() {
-  remote "${DOCKER_PRELUDE}
-    if \$D ps -a --filter name=${BOOTSTRAP_CONNECTOR} --format '{{.Names}}' | grep -q .; then
-      echo '  stopping the bootstrap connector ${BOOTSTRAP_CONNECTOR}'
-      \$D rm -f ${BOOTSTRAP_CONNECTOR} >/dev/null
-    fi
-    if systemctl is-active --quiet cloudflared 2>/dev/null; then
-      echo '  stopping and disabling the cloudflared service'
-      sudo -n systemctl disable --now cloudflared
-    fi
-    remaining=\$(\$D ps --filter ancestor=cloudflare/cloudflared --format '{{.Names}}' | tr '\\n' ' ')
-    echo \"  cloudflared containers now: \${remaining:-none}\""
+# All mutations run through one bounded VM helper. Its owner-only journal survives client loss.
+[[ "$REMOTE_DIR" =~ ^/[a-zA-Z0-9_/-]+$ && "$REMOTE_DIR" != / && "$REMOTE_DIR" != *..* ]] || { echo 'Unsafe remote directory' >&2; exit 2; }
+TOKEN="$(date -u +%Y%m%dT%H%M%S)-$$-${RANDOM}"
+ACTIVE=no
+UNCERTAIN=no
+IN_FLIGHT=no
+LAST_RESULT=0
+VM_READY_TIMEOUT="${VM_READY_TIMEOUT:-60}"
+[[ "$VM_READY_TIMEOUT" =~ ^[0-9]+$ && "$VM_READY_TIMEOUT" -ge 1 && "$VM_READY_TIMEOUT" -le 120 ]] || exit 2
+vm_action() {
+  local action="$1" output transport_rc marker request result tail
+  shift
+  IN_FLIGHT=yes
+  if output="$(remote "cd ${REMOTE_DIR} && VM_READY_TIMEOUT=${VM_READY_TIMEOUT} timeout 420 bash -s -- ${action} ${TOKEN} $*" < scripts/vm-release.sh)"; then transport_rc=0; else transport_rc=$?; fi
+  IN_FLIGHT=no
+  tail="$(printf '%s\n' "$output" | tail -1)"
+  read -r marker request result <<< "$tail" || true
+  printf '%s\n' "$output" | sed '$d'
+  if [[ "$transport_rc" != 0 || "$marker" != RELEASE_RESULT || "$request" != "$TOKEN" || ! "$result" =~ ^[0-9]+$ ]]; then
+    UNCERTAIN=yes; LAST_RESULT=2
+    echo "Transport completion is uncertain; journal ${TOKEN} must be reconciled before retry" >&2
+    return 2
+  fi
+  case "$result" in 0) LAST_RESULT=0;; 2) LAST_RESULT=2;; *) LAST_RESULT=1;; esac
+  return "$LAST_RESULT"
 }
+on_exit() {
+  local result=$?
+  trap - EXIT INT TERM HUP
+  if [[ "$ACTIVE" == yes && "$result" != 0 ]]; then
+    if [[ "$UNCERTAIN" == yes || "$LAST_RESULT" == 2 ]]; then
+      echo 'UNRESOLVED RELEASE: preserve the VM journal and run --reconcile; do not retry blindly' >&2
+      exit 2
+    fi
+    if vm_action recover; then
+      echo 'Release failed; previous image/configuration passed complete recovery checks' >&2
+      exit 1
+    fi
+    echo 'UNRESOLVED RELEASE: recovery could not be proved; database restoration may be required' >&2
+    exit 2
+  fi
+  exit "$result"
+}
+on_signal() {
+  echo 'Deployment interrupted; verifying recovery only if remote completion is known' >&2
+  if [[ "$ACTIVE" == yes && "$IN_FLIGHT" == no ]]; then exit 1; fi
+  UNCERTAIN=yes
+  exit 2
+}
+trap on_exit EXIT
+trap on_signal INT TERM HUP
 
 case "$MODE" in
-  preflight)
-    preflight
-    exit $?
-    ;;
-  status)
-    echo "== what is running =="
-    remote "${DOCKER_PRELUDE} cd ${REMOTE_DIR} && $(compose ps)"
-    remote "${DOCKER_PRELUDE} \$D stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}'"
-    remote "grep '^APP_IMAGE=' ${REMOTE_DIR}/.env.prod; free -m | head -2; df -h / | tail -1"
-    exit 0
-    ;;
-  rollback)
-    echo "== rolling back to ${ROLLBACK_TAG} =="
-    # The previous image is still on the disk unless someone pruned it, which is the whole reason a
-    # rollback is a restart and not a rebuild.
-    remote "${DOCKER_PRELUDE} \$D image inspect ${ROLLBACK_TAG} >/dev/null"
-    set_app_image "$ROLLBACK_TAG"
-    remote "${DOCKER_PRELUDE} cd ${REMOTE_DIR} && $(compose up -d --no-build app)"
-    remote "${DOCKER_PRELUDE} cd ${REMOTE_DIR} && $(compose ps)"
-    echo
-    echo "A rollback across a migration that changed the schema needs the backup taken before the"
-    echo "update: an older binary does not understand a newer schema. See docs/GCP_DEPLOYMENT.md."
-    exit 0
+  preflight) preflight; exit $? ;;
+  status) vm_action status; exit $? ;;
+  reconcile)
+    TOKEN="$RECONCILE_TOKEN"
+    [[ "$TOKEN" =~ ^[a-zA-Z0-9-]+$ ]] || exit 2
+    [[ "$DRY_RUN" == no ]] || { echo 'Would reconcile the pending VM journal'; exit 0; }
+    if vm_action reconcile; then exit 0; else exit 2; fi
     ;;
 esac
 
-[[ -n "$ARCHIVE" ]] || { echo "usage: deploy-vm.sh <image archive> | --preflight | --rollback <tag> | --status [--dry-run]" >&2; exit 2; }
-[[ -f "$ARCHIVE" ]] || { echo "no such archive: $ARCHIVE" >&2; exit 1; }
-[[ -f "${ARCHIVE}.sha256" ]] || { echo "no checksum beside ${ARCHIVE}; build it with release-image.sh" >&2; exit 1; }
-
-CHECKSUM="$(cut -d' ' -f1 "${ARCHIVE}.sha256")"
-BASENAME="$(basename "$ARCHIVE")"
-TAG="${APP_IMAGE:-opportunity-app:$(echo "$BASENAME" | sed -e 's/^opportunity-app-//' -e 's/\.tar\.gz$//')}"
-
-if [[ "$DRY_RUN" != "yes" ]]; then
-  echo "== preflight =="
-  preflight || { echo "Refusing to deploy onto a machine that is not ready." >&2; exit 1; }
-  echo
-fi
-
-echo "== sending ${BASENAME} to ${INSTANCE} over ${TRANSPORT} =="
-copy "$ARCHIVE" "${REMOTE_DIR}/${BASENAME}"
-copy docker-compose.prod.yml "${REMOTE_DIR}/docker-compose.prod.yml"
-copy docker-compose.e2micro.yml "${REMOTE_DIR}/docker-compose.e2micro.yml"
-copy scripts/vm-check.sh "${REMOTE_DIR}/vm-check.sh"
-
-echo "== verifying the transfer =="
-# A truncated image would otherwise be found by a container that will not start, on a machine that
-# is awkward to look at.
-remote "cd ${REMOTE_DIR} && echo '${CHECKSUM}  ${BASENAME}' | sha256sum -c -"
-
-echo "== loading =="
-remote "${DOCKER_PRELUDE} \$D load -i ${REMOTE_DIR}/${BASENAME} && rm -f ${REMOTE_DIR}/${BASENAME}"
-
-# What to go back to, read before anything is changed.
-#
-# This used to be read *after* `set_app_image "$TAG"`, so it always came back as the new tag, the
-# "is there something to go back to" test was always false, and the automatic rollback never ran
-# once. The running container is asked first because that is what is actually serving; .env.prod is
-# the fallback for the case where nothing is running yet.
-PREVIOUS_RUNNING="$(running_image)"
-PREVIOUS_CONFIGURED="$(configured_image)"
-PREVIOUS="${PREVIOUS_RUNNING:-$PREVIOUS_CONFIGURED}"
-if [[ -n "$PREVIOUS" ]]; then
-  echo "== currently running ${PREVIOUS} =="
-  # A file naming one image while another is serving means someone edited .env.prod without
-  # restarting, or a previous deployment half-finished. Worth saying before adding another change
-  # on top, and worth saying which one a rollback would return to.
-  if [[ -n "$PREVIOUS_CONFIGURED" && "$PREVIOUS_CONFIGURED" != "$PREVIOUS_RUNNING" ]]; then
-    echo "   NOTE: .env.prod names ${PREVIOUS_CONFIGURED} but ${PREVIOUS_RUNNING} is running." >&2
-    echo "   A rollback would return to ${PREVIOUS_RUNNING}, which is what is actually serving." >&2
-  fi
+if [[ "$MODE" == deploy ]]; then
+  [[ -n "$ARCHIVE" ]] || { echo 'Supply the reviewed image archive' >&2; exit 1; }
+  ARTIFACT="$(python3 scripts/release-artifact.py "$ARCHIVE" --revision "${REVIEWED_SHA:-}")"
+  read -r TAG IDENTITIES CHECKSUM <<< "$ARTIFACT"
+  [[ -z "${APP_IMAGE:-}" || "$APP_IMAGE" == "$TAG" ]] || { echo 'APP_IMAGE conflicts with the verified archive' >&2; exit 1; }
+  [[ "$(git rev-parse HEAD)" == "$REVIEWED_SHA" ]] || { echo 'Operator checkout differs from the reviewed image' >&2; exit 1; }
 else
-  echo "== nothing is running yet, so there is nothing to roll back to =="
+  TAG="$ROLLBACK_TAG"; IDENTITIES=-
+  [[ "$TAG" =~ ^[a-zA-Z0-9][a-zA-Z0-9:._/-]+$ ]] || { echo 'Unsafe rollback reference' >&2; exit 1; }
 fi
-
-echo "== the tunnel =="
-retire_bootstrap_connector
-
-echo "== recording which image to run =="
-set_app_image "$TAG"
-remote "chmod 600 ${REMOTE_DIR}/.env.prod"
-
-# Start it and check it. Both steps live in one function called from an `if`, so neither can end
-# the script under `set -e` before the recovery below gets a chance: a container that refuses to
-# start is as much a failed release as one that starts and fails its checks, and before this they
-# were handled by completely different amounts of code - one of them none.
-start_and_check() {
-  echo "== starting ${TAG} =="
-  # --no-build is belt and braces: the compose file carries a build section for the development
-  # machine, and this host must never try to use it.
-  if ! remote "${DOCKER_PRELUDE} cd ${REMOTE_DIR} && $(compose up -d --no-build)"; then
-    echo >&2
-    echo "COMPOSE COULD NOT START ${TAG}." >&2
-    return 1
-  fi
-  echo "== checking =="
-  # A failed check is a failed release. Without this the script printed "Deployed" over the top of
-  # a broken one and exited zero, which is the only way a bad release goes unnoticed.
-  if ! remote "cd ${REMOTE_DIR} && sh vm-check.sh"; then
-    echo >&2
-    echo "THE POST-DEPLOYMENT CHECK FAILED. ${TAG} is running and did not pass." >&2
-    return 1
-  fi
-}
-
-# The one way back, whatever went wrong. Returns non-zero when the recovery itself did not work,
-# which is a different and worse situation than a failed release.
-recover() {
-  if [[ -z "$PREVIOUS" || "$PREVIOUS" == "$TAG" ]]; then
-    echo "No earlier image is recorded, so nothing was rolled back automatically." >&2
-    echo "Fix it, or deploy a known-good archive." >&2
-    return 1
-  fi
-  echo "Going back to ${PREVIOUS}." >&2
-  # The image has to still be here. It is only ever removed by a prune, which this script never
-  # runs, but saying so when it is missing beats restarting into nothing.
-  if ! remote "${DOCKER_PRELUDE} \$D image inspect ${PREVIOUS} >/dev/null 2>&1"; then
-    echo "${PREVIOUS} is no longer on the machine; it cannot be restored automatically." >&2
-    echo "Load a known-good archive and deploy it." >&2
-    return 1
-  fi
-  set_app_image "$PREVIOUS"
-  remote "${DOCKER_PRELUDE} cd ${REMOTE_DIR} && $(compose up -d --no-build app)" || true
-
-  # Verified against the container, not against the file this script just wrote. The file saying
-  # the right thing proves only that the file was written.
-  local restored configured health
-  restored="$(running_image)"
-  configured="$(configured_image)"
-  echo >&2
-  if [[ "$restored" != "$PREVIOUS" || "$configured" != "$PREVIOUS" ]]; then
-    echo "RECOVERY FAILED. Running: ${restored:-nothing}. Configured: ${configured:-nothing}." >&2
-    echo "Expected ${PREVIOUS}. Fix this by hand before anything else." >&2
-    return 1
-  fi
-  echo "Rolled back: the running container and .env.prod both say ${PREVIOUS}." >&2
-
-  # And it has to actually work, which is the same bar the release had to clear: every check in
-  # vm-check.sh, not /health alone. This result used to be discarded with `|| true`, so a recovery
-  # that restored a version answering /health while refusing to authenticate anyone, or running
-  # without an identity layer, was still announced as a successful rollback. It was discarded
-  # because the rehearsal's failure injection also failed this run; the marker now names the image
-  # it applies to, so the restored version is judged on its own.
-  if ! remote "cd ${REMOTE_DIR} && sh vm-check.sh"; then
-    echo >&2
-    echo "RECOVERY FAILED: ${PREVIOUS} is running but does not pass its checks." >&2
-    return 1
-  fi
-  echo "The restored version passes every check." >&2
-}
-
-if start_and_check; then
-  echo
-  echo "Deployed ${TAG}. Keep the previous image on the VM until this one has been used:"
-  echo "  ./scripts/deploy-vm.sh --rollback <previous tag>"
-else
-  recovered=yes
-  recover || recovered=no
-  echo >&2
-  echo "What a rollback does NOT undo:" >&2
-  echo "  - migrations. They ran at startup and are not reversed; an older binary may not" >&2
-  echo "    understand the newer schema. If the restored version does not come up, restore the" >&2
-  echo "    backup taken before this deployment." >&2
-  echo "  - Cloudflare policy. Nothing here touches it. If this deployment was part of a" >&2
-  echo "    cutover, put the Access policy back by hand. See docs/AUTHENTICATION.md." >&2
-  if [[ "$recovered" == "no" ]]; then
-    echo >&2
-    echo "THE MACHINE IS NOT IN A KNOWN-GOOD STATE. Deal with this before anything else." >&2
-    exit 2
-  fi
-  # A failed release is a failure even when the recovery worked.
-  exit 1
+if [[ "$DRY_RUN" == yes ]]; then
+  echo "Would lock/journal ${REMOTE_DIR}, retain the previous immutable image, verify/load ${TAG}, start app and fully check identity/mode/readiness"
+  exit 0
 fi
+if [[ "$MODE" == deploy ]]; then preflight; fi
+ACTIVE=yes
+vm_action begin "$TAG" "$IDENTITIES" "${REVIEWED_SHA:--}" "$MODE"
+if [[ "$MODE" == deploy ]]; then
+  INCOMING="${REMOTE_DIR}/.release-state/incoming-${TOKEN}"
+  copy "$ARCHIVE" "${INCOMING}/$(basename "$ARCHIVE")"
+  copy docker-compose.prod.yml "${INCOMING}/docker-compose.prod.yml"
+  copy docker-compose.e2micro.yml "${INCOMING}/docker-compose.e2micro.yml"
+  copy scripts/vm-check.sh "${INCOMING}/vm-check.sh"
+  vm_action load "$(basename "$ARCHIVE")" "$CHECKSUM"
+fi
+vm_action apply
+vm_action finish
+ACTIVE=no
+echo "Verified ${MODE}: ${TAG}. The retained rollback reference and prior configuration are in .release-history/${TOKEN}."
+echo 'No database restore or Cloudflare policy change was performed.'
