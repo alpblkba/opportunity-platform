@@ -24,6 +24,8 @@ pub enum HttpError {
     Transport(String),
     #[error("response body was not valid json: {0}")]
     Json(String),
+    #[error("response body of at least {seen} bytes exceeds the {cap} byte cap")]
+    TooLarge { seen: u64, cap: usize },
 }
 
 #[derive(Debug)]
@@ -142,10 +144,10 @@ impl HttpClient {
     }
 
     fn too_large(&self, seen: u64) -> HttpError {
-        HttpError::Transport(format!(
-            "response body of at least {} bytes exceeds the {} byte cap",
-            seen, self.max_body_bytes
-        ))
+        HttpError::TooLarge {
+            seen,
+            cap: self.max_body_bytes,
+        }
     }
 }
 

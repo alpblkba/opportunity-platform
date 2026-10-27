@@ -127,6 +127,27 @@ pub fn assess(
     }
 }
 
+/// Workday reports the total on the first page and often 0 on the pages after it, so the first
+/// non-zero report stands and a later 0 means nothing. A 0 beside records is no total at all. A later,
+/// different non-zero total means the inventory moved during the sweep, which is a partial sweep.
+fn reconcile_total(
+    known: Option<i32>,
+    page: Option<i32>,
+    page_len: usize,
+) -> (Option<i32>, Option<String>) {
+    let page = page.filter(|t| *t > 0 || page_len == 0);
+    match (known, page) {
+        (None, page) => (page, None),
+        (Some(first), Some(t)) if t != first && t != 0 => (
+            known,
+            Some(format!(
+                "the reported total changed from {first} to {t} during the sweep"
+            )),
+        ),
+        _ => (known, None),
+    }
+}
+
 pub async fn scan(client: &HttpClient, tenant: &str, instance: &str, site: &str) -> ScanResult {
     let url = endpoint(tenant, instance, site);
     let mut postings: Vec<FetchedPosting> = Vec::new();
@@ -181,8 +202,12 @@ pub async fn scan(client: &HttpClient, tenant: &str, instance: &str, site: &str)
             }
         }
         pages_fetched += 1;
-        total_reported = page_total.or(total_reported);
         let page_len = page_postings.len();
+        let (total, changed) = reconcile_total(total_reported, page_total, page_len);
+        total_reported = total;
+        if let Some(reason) = changed {
+            hazard.get_or_insert(reason);
+        }
         postings.extend(page_postings);
         last_body = Some(response.body);
 
@@ -271,6 +296,28 @@ mod tests {
     const PAGE_DUPLICATE: &str = include_str!("../tests/fixtures/workday-page-duplicate-id.json");
     const PAGE_NO_DESCRIPTION: &str =
         include_str!("../tests/fixtures/workday-page-no-description.json");
+
+    #[test]
+    fn the_first_reported_total_stands_and_later_zeroes_are_the_known_quirk() {
+        // Marvell, 2026-10-27: 343 on the first page, 0 on every later one, 343 records read.
+        let mut known = None;
+        for (page_total, len) in [(Some(343), 20), (Some(0), 20), (Some(0), 3)] {
+            let (total, changed) = reconcile_total(known, page_total, len);
+            assert!(changed.is_none());
+            known = total;
+        }
+        assert_eq!(known, Some(343));
+        assert_eq!(assess(343, 343, known, None).0, RunOutcome::OkComplete);
+        // A zero beside records is no total; a zero on an empty first page is a verified empty board.
+        assert_eq!(reconcile_total(None, Some(0), 20).0, None);
+        assert_eq!(reconcile_total(None, Some(0), 0).0, Some(0));
+        // A different non-zero total later means the inventory moved: partial, never complete.
+        let (total, changed) = reconcile_total(Some(343), Some(350), 20);
+        assert_eq!(total, Some(343));
+        assert!(changed.unwrap().contains("changed from 343 to 350"));
+        // The old behaviour, a later 0 overwriting the first total, is what made complete sweeps partial.
+        assert_eq!(assess(343, 343, Some(0), None).0, RunOutcome::Partial);
+    }
 
     fn parse(body: &str) -> (Vec<FetchedPosting>, Option<i32>) {
         parse_page(body, "examplechip", "wd3").unwrap()

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use opportunity_domain::{decode_entities, FetchedPosting, RunOutcome, ScanResult, SourceRunStats};
 use serde::Deserialize;
 
-use crate::client::HttpClient;
+use crate::client::{HttpClient, HttpError};
 use crate::location;
 
 pub const HOST: &str = "boards-api.greenhouse.io";
@@ -10,6 +10,11 @@ pub const HOST: &str = "boards-api.greenhouse.io";
 /// Documented job board endpoint. `content=true` is what returns the description body; without it the board returns titles only.
 fn endpoint(board_token: &str) -> String {
     format!("https://{HOST}/v1/boards/{board_token}/jobs?content=true")
+}
+
+/// The same documented endpoint without descriptions: every job, titles only, a fraction of the size.
+fn titles_endpoint(board_token: &str) -> String {
+    format!("https://{HOST}/v1/boards/{board_token}/jobs")
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,8 +127,18 @@ pub(crate) fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
 
 pub async fn scan(client: &HttpClient, board_token: &str) -> ScanResult {
     let url = endpoint(board_token);
-    let response = match client.get_json(&url, &[HOST]).await {
-        Ok(response) => response,
+    // A board whose descriptions exceed the memory cap (Anthropic's, at 8 MiB) is still listed in
+    // full from the titles-only form: the inventory stays complete, and every posting is title-only,
+    // which ranking already sends to review because its requirements are unknown.
+    let (response, titles_only) = match client.get_json(&url, &[HOST]).await {
+        Ok(response) => (response, false),
+        Err(HttpError::TooLarge { .. }) => match client
+            .get_json(&titles_endpoint(board_token), &[HOST])
+            .await
+        {
+            Ok(response) => (response, true),
+            Err(error) => return ScanResult::failed(RunOutcome::HttpError, error.to_string()),
+        },
         Err(error) => return ScanResult::failed(RunOutcome::HttpError, error.to_string()),
     };
     if let Some(outcome) = crate::status_outcome(response.status) {
@@ -135,12 +150,16 @@ pub async fn scan(client: &HttpClient, board_token: &str) -> ScanResult {
     match parse(&response.body) {
         Ok((postings, stats, complete)) => {
             let outcome = crate::outcome_for(complete, postings.len());
-            let diagnostic = (!complete).then(|| {
-                format!(
+            let diagnostic = if !complete {
+                Some(format!(
                     "board reported {:?} jobs but the response carried {}",
                     stats.total_reported, stats.records_seen
-                )
-            });
+                ))
+            } else {
+                titles_only.then(|| {
+                    "descriptions exceed the size cap, so titles only were listed".to_owned()
+                })
+            };
             ScanResult {
                 outcome,
                 postings,
