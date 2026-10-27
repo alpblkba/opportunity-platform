@@ -200,8 +200,15 @@ case "$ACTION" in
   status)
     if [[ -d "$STATE" ]]; then printf 'UNRESOLVED release=%s phase=%s\n' "$(cat "$STATE/token")" "$(cat "$STATE/phase")"; exit 2; fi
     app="$(app_id)"; test -n "$app"
-    printf 'Configured image: %s\nRunning immutable image: %s\nActual access mode: %s\n' "$(value APP_IMAGE)" "$("${D[@]}" inspect "$app" --format '{{.Image}}')" "$(mode "$app")"
+    running="$("${D[@]}" inspect "$app" --format '{{.Image}}')"
+    printf 'Configured image: %s\nRunning immutable image: %s\nActual access mode: %s\n' "$(value APP_IMAGE)" "$running" "$(mode "$app")"
     echo 'No pending release journal'
+    # Machine-readable, for release-gate.py: what actually runs, and SQLx's own record of the schema.
+    printf 'DEPLOYED_REVISION=%s\nDEPLOYED_IMAGE=%s\n' "$("${D[@]}" image inspect "$running" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" "$running"
+    dc exec -T db sh -c 'psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL' | sed 's/^/MIGRATION=/'
+select version || ':' || encode(checksum, 'hex') from _sqlx_migrations where success order by version;
+SQL
+    echo MIGRATIONS_END
     ;;
   *) exit 2 ;;
 esac

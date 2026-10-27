@@ -2,11 +2,18 @@
 # Put a built image on the VM and start it. Nothing here compiles anything on the far side.
 #
 #   ./scripts/deploy-vm.sh --preflight                    # check everything, change nothing
+#   ./scripts/deploy-vm.sh --check-transfer               # writes and removes one empty file over scp
 #   ./scripts/deploy-vm.sh --dry-run <archive>            # print every command, touch nothing
+#   ./scripts/deploy-vm.sh --gate                         # would REVIEWED_SHA be deployed? changes nothing
 #   ./scripts/deploy-vm.sh dist/opportunity-app-<tag>.tar.gz
+#   ./scripts/deploy-vm.sh --migration-rollout <verified backup dir> dist/opportunity-app-<tag>.tar.gz
 #   ./scripts/deploy-vm.sh --rollback opportunity-app:<previous tag>
 #   ./scripts/deploy-vm.sh --status
 #   ./scripts/deploy-vm.sh --reconcile                   # inspect and resolve a pending journal
+#   ./scripts/deploy-vm.sh --fetch-backup                # encrypted dump + private tree into BACKUP_OUT_DIR
+#
+# Every deploy first runs release-gate.py against what the VM reports it runs. A release that adds
+# migrations is refused unless --migration-rollout names a backup that restore-rehearsal.sh verified.
 #
 # Transport is Google's IAP tunnel by default, which needs no public address on the VM and no open
 # firewall: the connection is authorized by IAM and tunnelled over Google's front end. Set
@@ -29,6 +36,8 @@ MODE="deploy"
 RECONCILE_TOKEN="pending"
 ARCHIVE=""
 ROLLBACK_TAG=""
+ROLLOUT_DIR=""
+BACKUP_WORK=""
 # What the machine has to be. Taken from the archive's own name when there is one, so a rehearsal on
 # other hardware checks itself honestly rather than being told to skip the check.
 EXPECTED_MACHINE="x86_64"
@@ -37,8 +46,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN="yes"; shift ;;
     --preflight) MODE="preflight"; shift ;;
+    --check-transfer) MODE="check-transfer"; shift ;;
+    --gate) MODE="gate"; shift ;;
+    --migration-rollout) ROLLOUT_DIR="${2:?--migration-rollout needs the verified backup directory}"; shift 2 ;;
     --rollback) MODE="rollback"; ROLLBACK_TAG="${2:?--rollback needs the image tag to go back to}"; shift 2 ;;
     --status) MODE="status"; shift ;;
+    --fetch-backup) MODE="fetch-backup"; shift ;;
     --reconcile) MODE="reconcile"; shift; if [[ $# -gt 0 && "$1" != -* ]]; then RECONCILE_TOKEN="$1"; shift; fi ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) ARCHIVE="$1"; shift ;;
@@ -129,20 +142,7 @@ preflight() {
     return 1
   fi
   echo "  ok    a command runs on the machine"
-  if [[ "$TRANSPORT" == "iap" ]]; then
-    # scp uses a second code path inside gcloud, and finding that out during a 38 MB transfer is
-    # worse than finding it out now with an empty file.
-    local probe
-    probe="$(mktemp)"
-    if copy "$probe" "${REMOTE_DIR}/.scp-probe-${TOKEN}" >/dev/null 2>&1; then
-      echo "  ok    scp over IAP works"
-      remote "rm -f ${REMOTE_DIR}/.scp-probe-${TOKEN}" >/dev/null 2>&1 || true
-    else
-      echo "  FAIL  scp over IAP failed; ssh works, so this is usually ${REMOTE_DIR} not being writable"
-      problems=$((problems + 1))
-    fi
-    rm -f "$probe"
-  fi
+  # Read-only by design: the scp path is exercised by --check-transfer, which says that it writes.
 
   echo
   echo "== on the machine =="
@@ -207,7 +207,7 @@ preflight() {
 
     echo \"REMOTE_PROBLEMS=\$problems\"
   ")"
-  printf '%s\n' "$report" | grep -v '^REMOTE_PROBLEMS='
+  printf '%s\n' "$report" | { grep -v '^REMOTE_PROBLEMS=' || true; }
   local remote_problems
   remote_problems="$(printf '%s\n' "$report" | sed -n 's/^REMOTE_PROBLEMS=//p' | tail -1)"
   problems=$((problems + ${remote_problems:-0}))
@@ -250,6 +250,8 @@ vm_action() {
 on_exit() {
   local result=$?
   trap - EXIT INT TERM HUP
+  # A backup that did not finish leaves nothing that could be mistaken for one.
+  if [[ -n "$BACKUP_WORK" ]]; then rm -rf "$BACKUP_WORK"; fi
   if [[ "$ACTIVE" == yes && "$result" != 0 ]]; then
     if [[ "$UNCERTAIN" == yes || "$LAST_RESULT" == 2 ]]; then
       echo 'UNRESOLVED RELEASE: preserve the VM journal and run --reconcile; do not retry blindly' >&2
@@ -273,8 +275,80 @@ on_signal() {
 trap on_exit EXIT
 trap on_signal INT TERM HUP
 
+# Read-only on the VM, and nothing is written there: the owner's machine pulls both streams over the
+# deploy transport and encrypts them to a pinned key fingerprint before they reach a disk here. All of
+# it lands in a private .incomplete directory that becomes the backup only once both streams, their
+# checks and the manifest have succeeded; any failure removes it (on_exit), so a partial backup never
+# looks like a backup. The dump comes first, so every CV it references was already on disk when the
+# file archive was taken (uploads only ever add files); restore-rehearsal.sh checks exactly that.
+fetch_backup() {
+  local out="${BACKUP_OUT_DIR:?set BACKUP_OUT_DIR}" recipient="${BACKUP_ENCRYPT_TO:?set BACKUP_ENCRYPT_TO to the owner key fingerprint}"
+  local stamp final status
+  # Single quotes keep $POSTGRES_USER and $POSTGRES_DB for the database container's own environment.
+  local dump='exec -T db sh -c '"'"'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom --no-owner'"'"
+  local files='exec -T app tar -czf - -C /app private'
+  if [[ "$DRY_RUN" == yes ]]; then
+    remote "cd ${REMOTE_DIR} && ${DOCKER_PRELUDE} $(compose "$dump")"
+    remote "cd ${REMOTE_DIR} && ${DOCKER_PRELUDE} $(compose "$files")"
+    return 0
+  fi
+  python3 scripts/backup-stream.py check-recipient "$recipient"
+  umask 077
+  mkdir -p "$out"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  final="${out}/opportunity-${stamp}"
+  [[ ! -e "$final" ]] || { echo "${final} already exists; refusing to overwrite a backup" >&2; return 1; }
+  BACKUP_WORK="$(mktemp -d "${out}/.incomplete-${stamp}.XXXXXX")"
+  status="${BACKUP_WORK}/production-status.txt"
+  if ! vm_action status > "$status"; then
+    echo 'note: production state is unavailable, so this backup cannot be a migration recovery point' >&2
+  fi
+  UNCERTAIN=no; LAST_RESULT=0
+  remote "cd ${REMOTE_DIR} && ${DOCKER_PRELUDE} $(compose "$dump")" \
+    | python3 scripts/backup-stream.py encrypt --expect pgdump --recipient "$recipient" --output "${BACKUP_WORK}/database.dump.gpg"
+  remote "cd ${REMOTE_DIR} && ${DOCKER_PRELUDE} $(compose "$files")" \
+    | python3 scripts/backup-stream.py encrypt --expect gzip --recipient "$recipient" --output "${BACKUP_WORK}/private.tar.gz.gpg"
+  python3 scripts/backup-stream.py manifest "$BACKUP_WORK" "$recipient"
+  mv "$BACKUP_WORK" "$final"
+  BACKUP_WORK=""
+  echo "Encrypted backup complete: ${final}"
+  echo "Prove it restores before relying on it: ./scripts/restore-rehearsal.sh ${final}"
+}
+
+# The only check here that writes to the VM, which is why it is not part of --preflight: scp is a
+# second code path inside gcloud, and finding out during a 40 MB transfer is worse than with an empty file.
+check_transfer() {
+  local probe rc=0
+  probe="$(mktemp)"
+  if copy "$probe" "${REMOTE_DIR}/.scp-probe-${TOKEN}"; then
+    echo "ok    scp to ${REMOTE_DIR} works"
+    remote "rm -f ${REMOTE_DIR}/.scp-probe-${TOKEN}" || { echo "FAIL  could not remove ${REMOTE_DIR}/.scp-probe-${TOKEN}" >&2; rc=1; }
+  else
+    echo "FAIL  scp failed; ssh works, so this is usually ${REMOTE_DIR} not being writable" >&2; rc=1
+  fi
+  rm -f "$probe"
+  return "$rc"
+}
+
+# Asks the VM what it actually runs and lets release-gate.py decide. 0 deploy, 10 already running,
+# 2 another release is unresolved or still in progress there, anything else refused.
+release_gate() {
+  local status rc=0 state=0
+  status="$(mktemp)"
+  vm_action status > "$status" || state=$?
+  UNCERTAIN=no; LAST_RESULT=0
+  python3 scripts/release-gate.py --status "$status" --candidate "${REVIEWED_SHA:?set REVIEWED_SHA to the full candidate commit}" \
+    --trusted-ref "${TRUSTED_REF:-origin/master}" ${ROLLOUT_DIR:+--rollout-manifest "$ROLLOUT_DIR"} || rc=$?
+  rm -f "$status"
+  if [[ "$state" == 2 && "$rc" != 0 ]]; then return 2; fi
+  return "$rc"
+}
+
 case "$MODE" in
   preflight) preflight; exit $? ;;
+  check-transfer) check_transfer; exit $? ;;
+  gate) release_gate; exit $? ;;
+  fetch-backup) fetch_backup; exit $? ;;
   status) vm_action status; exit $? ;;
   reconcile)
     TOKEN="$RECONCILE_TOKEN"
@@ -298,7 +372,13 @@ if [[ "$DRY_RUN" == yes ]]; then
   echo "Would lock/journal ${REMOTE_DIR}, retain the previous immutable image, verify/load ${TAG}, start app and fully check identity/mode/readiness"
   exit 0
 fi
-if [[ "$MODE" == deploy ]]; then preflight; fi
+if [[ "$MODE" == deploy ]]; then
+  preflight
+  gate=0; release_gate || gate=$?
+  if [[ "$gate" == 10 ]]; then echo "Production already runs ${REVIEWED_SHA}; nothing to deploy."; exit 0; fi
+  [[ "$gate" != 2 ]] || { echo 'Production has an unresolved or in-progress release; this run changed nothing. Use --reconcile.' >&2; exit 2; }
+  [[ "$gate" == 0 ]] || { echo 'The release gate refused this deployment; production was not touched.' >&2; exit 1; }
+fi
 ACTIVE=yes
 vm_action begin "$TAG" "$IDENTITIES" "${REVIEWED_SHA:--}" "$MODE"
 if [[ "$MODE" == deploy ]]; then

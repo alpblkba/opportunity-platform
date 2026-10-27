@@ -101,7 +101,9 @@ echo
 echo "== one tunnel connector, not two =="
 # A bootstrap connector left running costs memory this machine does not have and would keep serving
 # after the managed one is replaced.
-connectors=$($D ps --filter ancestor=cloudflare/cloudflared --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
+# By image reference, not `--filter ancestor`, which resolves a bare name to :latest and would miss a
+# connector started from the pinned tag or digest.
+connectors=$($D ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk '$2 ~ /^cloudflare\/cloudflared([:@]|$)/ {printf "%s ", $1}')
 count=$(printf '%s' "$connectors" | wc -w | tr -d ' ')
 if [ "$count" -le 1 ]; then
   pass "cloudflared containers: ${connectors:-none}"

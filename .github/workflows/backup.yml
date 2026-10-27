@@ -1,0 +1,57 @@
+name: backup
+
+# OPTIONAL and OFF by the owner's decision: backups are pulled to the owner's Mac for now
+# (docs/DEPLOYMENT.md "Backups"). This is the documented path to continuous off-host copies, and it
+# does nothing until BACKUP_ENABLED is true. deploy-vm.sh --fetch-backup streams pg_dump and the
+# private tree over IAP and encrypts them here to the owner's pinned key fingerprint before they touch
+# a disk; gcloud storage cp then copies the ciphertext directory to a private bucket. The private key
+# never leaves the owner, so these copies are restore-rehearsed on the owner's machine, not here.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: backup
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  backup:
+    name: Encrypted off-host backup
+    if: vars.BACKUP_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    env:
+      GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+      GCP_INSTANCE: ${{ vars.GCP_INSTANCE }}
+      GCP_ZONE: ${{ vars.GCP_ZONE }}
+      BACKUP_ENCRYPT_TO: ${{ vars.BACKUP_ENCRYPT_TO }}
+      BACKUP_OUT_DIR: /tmp/opportunity-backup
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Import the owner's public key (public half only)
+        env:
+          PUBLIC_KEY: ${{ vars.BACKUP_GPG_PUBLIC_KEY }}
+        run: printf '%s\n' "$PUBLIC_KEY" | gpg --batch --import
+      - name: Stream an encrypted dump and private tree from the VM
+        run: ./scripts/deploy-vm.sh --fetch-backup
+      - name: Copy the ciphertext off-host
+        env:
+          BUCKET: ${{ vars.BACKUP_BUCKET }}
+        run: gcloud storage cp --recursive --no-clobber "$BACKUP_OUT_DIR"/opportunity-* "gs://${BUCKET}/opportunity/"

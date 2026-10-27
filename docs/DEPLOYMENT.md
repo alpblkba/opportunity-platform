@@ -127,14 +127,35 @@ Rehearsed locally on 2026-10-22: 1854 opportunities, 1905 postings, 14 sources, 
 
 ## Backups
 
+**Owner decision (2026-10-27): backups are pulled to the owner's Mac.** Nothing is written on the VM,
+so the e2-micro's disk is never involved, and the VM holds no storage credentials.
+
 ```bash
-./scripts/backup.sh                                    # database dump plus the private tree, with a checksum
-./scripts/restore.sh backups/<file>.dump rehearsal_db  # into a throwaway name
+gpg --fingerprint you@example.com            # once: note the 40-hex fingerprint of your own key
+BACKUP_OUT_DIR=~/Backups/opportunity BACKUP_ENCRYPT_TO=<FINGERPRINT> ./scripts/deploy-vm.sh --fetch-backup
+./scripts/restore-rehearsal.sh ~/Backups/opportunity/opportunity-<stamp>
 ```
 
-`restore.sh` verifies the checksum first and refuses to overwrite an existing database unless `ALLOW_OVERWRITE=yes` is passed, because the usual reason to run it is a rehearsal and the usual disaster is pointing it at the live database. Rehearsed locally: restored into a disposable database, row counts matched, and both real databases were untouched.
+- `--fetch-backup` streams `pg_dump` and the private tree (CVs, browser evidence) over IAP and encrypts
+  both on the Mac to the key named by its full fingerprint; a name, email or short id is refused, as is
+  a revoked, expired or encrypt-incapable key. Everything lands in a mode-700 `.incomplete-*` directory
+  that becomes `opportunity-<stamp>/` only after both streams were checked as a real `pg_dump`/gzip
+  stream, hashed, and written with a `manifest.json` (production revision, migration checksums,
+  plaintext and ciphertext SHA-256). Any failure removes it; earlier backups are never touched.
+- The dump is taken first, then the files. Uploads only ever add files, so every CV the dump references
+  is in the archive; a CV uploaded between the two is an extra file, not a missing one.
+- `restore-rehearsal.sh` verifies the checksums, decrypts with your key, restores into a throwaway
+  `postgres:16-alpine` container with no network, unpacks the private tree into a temporary directory,
+  and checks every referenced CV's bytes. Success writes `restore-verified.json`, which a migration
+  rollout requires. It never touches a real database.
+- **This is not continuous off-host protection:** a backup exists only when the Mac runs it. Run it
+  before every deploy (a migration rollout refuses a backup older than 24 hours) and periodically.
+- Later, optionally: `.github/workflows/backup.yml` (off until `BACKUP_ENABLED`) runs the same fetch
+  daily from GitHub Actions to a private bucket; see "Optional automated off-host backups". It costs a
+  bucket and needs the deploy identity; nothing is provisioned until the owner decides.
 
-`scripts/backup.sh` writes files under `BACKUP_DIR` (default `backups/`) on the same machine, which protects against a mistaken `drop` and not against losing the host. The dumps contain the CV, the answers and the application history, so they must leave the host: a cron entry running `rsync` or `rclone` to storage elsewhere, encrypted at rest. Verify one occasionally by restoring it into a throwaway database. A backup nobody has restored is a hypothesis.
+`scripts/backup.sh` and `scripts/restore.sh` remain for a host-local copy and for restoring a single
+dump; `restore.sh` refuses to overwrite an existing database unless `ALLOW_OVERWRITE=yes`.
 
 ## The scheduler
 
@@ -154,16 +175,123 @@ Live employer submission. The browser worker reaches loopback only; opening that
 
 ## Updating, rolling back and recovering
 
-Follow the owner's separately approved production rollout procedure. Build the exact reviewed release elsewhere, retain the actual previous image, create encrypted database and private-file backups, copy them off-host and prove an isolated restore before migration. Do not build on the e2-micro or use `migrate-to-cloud.sh` to upgrade existing data.
+Every deploy, from a laptop or from Actions, first asks the VM what it actually runs
+(`vm-release.sh status`: the running image's `org.opencontainers.image.revision` label and SQLx's own
+`_sqlx_migrations` checksums) and lets `scripts/release-gate.py` decide. It refuses when production
+has an unresolved or in-progress release, runs a revision this repository does not know (an
+out-of-band build), or runs something the candidate does not descend from; when the candidate is not
+on `origin/master`; when an applied migration is missing from the candidate or was edited after it
+ran; and when a migration would apply out of order. Re-deploying the running revision does nothing.
 
-Migrations run before the server binds, in transactions recorded by SQLx. Migration 0005 preserves legacy rows, but the older runtime refuses its unknown migration history. Automatic image recovery cannot reverse that history. Recovery to the pre-0005 binary requires a new database restored from the pre-release backup and the matching retained deployment files/checker; it must preserve the failed database for investigation. Do not edit migration history or overwrite the live database to bypass this gate.
+A release that **adds** migrations is never automatic, because the older image refuses a newer
+migration history and image rollback therefore cannot undo it. Deploy it from your machine:
+
+```bash
+BACKUP_OUT_DIR=~/Backups/opportunity BACKUP_ENCRYPT_TO=<FINGERPRINT> ./scripts/deploy-vm.sh --fetch-backup
+./scripts/restore-rehearsal.sh ~/Backups/opportunity/opportunity-<stamp>
+REVIEWED_SHA="$(git rev-parse HEAD)" ./scripts/release-image.sh          # clean checkout of a master commit
+REVIEWED_SHA="$(git rev-parse HEAD)" ./scripts/deploy-vm.sh --migration-rollout ~/Backups/opportunity/opportunity-<stamp> \
+  "dist/opportunity-app-$(git rev-parse HEAD)-amd64.tar.gz"
+./scripts/deploy-vm.sh --status
+```
+
+The gate accepts the backup only if it was taken from the revision and migration history production
+runs now, is under 24 hours old, matches its manifest, and passed the rehearsal. If the migrated
+release then fails, the previous image will not start against the migrated schema: restore the
+verified backup into a new database for the previous image and keep the migrated one for
+investigation. Never edit `_sqlx_migrations` to get past this.
+
+`--preflight` is read-only. `--check-transfer` is the one check that writes (an empty file over scp,
+removed again), and says so. Do not build on the e2-micro or use `migrate-to-cloud.sh` to upgrade
+existing data.
+
+## Automated deployment
+
+`.github/workflows/deploy.yml` runs after `continuous integration` succeeds on a push to `master`
+(or by hand on `master`): it re-checks that the exact SHA is on master and green, authenticates with
+Workload Identity Federation, runs `deploy-vm.sh --gate` against production's real state, and only
+then builds with `release-image.sh`, preflights and deploys over IAP and reports `--status`. A
+repeated trigger for the running revision ends at the gate. A release that adds migrations is refused
+here, manual runs included: it needs a verified backup only the owner's machine holds (above). Failed
+runs are emailed by GitHub. The workflow does nothing until `DEPLOY_ENABLED` is `true`.
+
+One-time bootstrap by the owner (no keys are created; GitHub receives short-lived tokens):
+
+```bash
+PROJECT=project-484f9dc3-1a36-4b55-9e8
+NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
+gcloud iam workload-identity-pools create github --project="$PROJECT" --location=global
+gcloud iam workload-identity-pools providers create-oidc opportunity-platform --project="$PROJECT" \
+  --location=global --workload-identity-pool=github --issuer-uri=https://token.actions.githubusercontent.com \
+  --attribute-mapping=google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.environment=assertion.environment \
+  --attribute-condition="assertion.repository=='alpblkba/opportunity-platform' && assertion.environment=='production'"
+gcloud iam service-accounts create opportunity-deploy --project="$PROJECT"
+SA="opportunity-deploy@${PROJECT}.iam.gserviceaccount.com"
+gcloud iam service-accounts add-iam-policy-binding "$SA" --project="$PROJECT" --role=roles/iam.workloadIdentityUser \
+  --member="principalSet://iam.googleapis.com/projects/${NUMBER}/locations/global/workloadIdentityPools/github/attribute.repository/alpblkba/opportunity-platform"
+for role in roles/compute.viewer roles/iap.tunnelResourceAccessor roles/compute.osAdminLogin; do
+  gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${SA}" --role="$role"
+done
+```
+
+If the VM runs as a service account, also grant `roles/iam.serviceAccountUser` on that account to
+`$SA`. OS Login must be enabled on the instance (`enable-oslogin=TRUE`); check with
+`gcloud compute instances describe opportunity-platform --zone us-central1-a --format='value(metadata.items)'`
+before changing it, because without OS Login `gcloud compute ssh` writes keys into instance metadata.
+
+Then in GitHub: create the `production` environment limited to the `master` branch, and set:
+
+```bash
+gh variable set GCP_PROJECT --body project-484f9dc3-1a36-4b55-9e8
+gh variable set GCP_INSTANCE --body opportunity-platform
+gh variable set GCP_ZONE --body us-central1-a
+gh variable set GCP_DEPLOY_SERVICE_ACCOUNT --body "opportunity-deploy@project-484f9dc3-1a36-4b55-9e8.iam.gserviceaccount.com"
+gh variable set GCP_WORKLOAD_IDENTITY_PROVIDER --body "projects/${NUMBER}/locations/global/workloadIdentityPools/github/providers/opportunity-platform"
+gh variable set DEPLOY_ENABLED --body true
+```
+
+Activate it only after the first migration-bearing release has been rolled out by hand as above and
+CI has passed in GitHub: from then on ordinary code-only merges deploy themselves.
 
 ## Known limitations
 
 Cloudflare Access assertion validation is tested against assertions signed with a test key held in the repository: the positive path accepts a correctly signed, correctly addressed, unexpired token for an allowlisted identity, and the negative paths refuse a wrong audience, a wrong issuer, an expired token, an unknown key id, a tampered payload, an identity outside the allowlist, a token with no identity, `alg: none` and garbage. The deployed instance has since been signed into with a real Access one-time code and returned authenticated API responses, so the team domain, the key endpoint and the audience tag are confirmed as well as the verification logic.
 
-There is no rate limiting at the origin. Cloudflare Access is the only thing in front, which is appropriate for one user but means a leaked assertion is not additionally throttled.
+In `cloudflare` mode nothing at the origin throttles requests carrying a valid assertion; native login (`both`/`native`) has its own per-address limiter (see docs/AUTHENTICATION.md), and a Cloudflare rate-limiting rule is recommended before any cutover.
 
-Off-host backup copying is a manual step the owner has to automate; nothing in this repository does it.
+Backups exist only when the owner's Mac pulls one (above); the optional workflow below is off.
+
+The tunnel image is pinned to the cloudflared build production ran on 2026-10-27 (2026.10.3, by
+digest). A deploy restarts only `app`, so the pin takes effect when the tunnel is next recreated, with
+the same image.
+
+## Optional automated off-host backups
+
+Off by the owner's decision; nothing here is provisioned.
+
+The `backup` workflow runs daily (03:17 UTC) and on demand. `deploy-vm.sh --fetch-backup` streams
+`pg_dump` and the private tree over IAP and encrypts both to the owner's OpenPGP public key on the
+runner before anything is written, so plaintext never reaches a disk off the VM and the VM needs no
+storage credentials. The ciphertext and its `.sha256` go to a private bucket; `gcloud storage cp`
+verifies the upload's checksums. Failed runs are emailed by GitHub. It reuses the deploy identity
+from "Automated deployment".
+
+```bash
+gcloud storage buckets create gs://REPLACE_WITH_BUCKET --project=project-484f9dc3-1a36-4b55-9e8 \
+  --location=us-central1 --uniform-bucket-level-access --public-access-prevention
+# Keep 90 days of daily copies; objects are never overwritten (--no-clobber).
+printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":90}}]}' > lifecycle.json
+gcloud storage buckets update gs://REPLACE_WITH_BUCKET --lifecycle-file=lifecycle.json
+gcloud storage buckets add-iam-policy-binding gs://REPLACE_WITH_BUCKET --role=roles/storage.objectCreator \
+  --member="serviceAccount:opportunity-deploy@project-484f9dc3-1a36-4b55-9e8.iam.gserviceaccount.com"
+gh variable set BACKUP_BUCKET --body REPLACE_WITH_BUCKET
+gh variable set BACKUP_ENCRYPT_TO --body "<your key's full 40-hex fingerprint>"
+gpg --armor --export "<your key's fingerprint>" | gh variable set BACKUP_GPG_PUBLIC_KEY
+gh variable set BACKUP_ENABLED --body true
+```
+
+`objectCreator` cannot read or delete, so a leaked workflow identity can add copies but not destroy
+them. Restore rehearsal happens on your own machine, where the private key is: download one
+`opportunity-<stamp>/` directory and run `scripts/restore-rehearsal.sh` on it.
 
 Linux amd64 execution was verified under emulation; native amd64 and 1 GiB capacity remain unverified, as described under Architectures.
