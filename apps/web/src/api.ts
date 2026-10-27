@@ -20,6 +20,7 @@ export const api = {
   disable: (id: string) => post(`/policies/${id}/state`, { enabled: false, revoke: true }),
   apply: (id: string) => post(`/home/apply/${id}`),
   answer: (id: string, answer: string) => post(`/home/answer/${id}`, { answer }),
+  pause: (paused: boolean) => post("/home/pause", { paused }),
   upload: (file: File) => request("/documents/cv?filename=" + encodeURIComponent(file.name), {
     method: "POST", headers: { "content-type": "application/octet-stream" }, body: file,
   }),
@@ -40,5 +41,7 @@ export interface Home {
   policies: { id: string; name: string; enabled: boolean; source_keys: string[]; profile_id: string; expires_at: string }[];
   last_updated: string | null;
   email_configured: boolean;
+  submissions_paused: boolean;
+  max_automatic_per_day: number;
   mail: { application_id: string; state: string; error?: string }[];
 }

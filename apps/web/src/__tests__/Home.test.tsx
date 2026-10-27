@@ -44,3 +44,9 @@ it("labels the blended priority honestly and flags postings that need review",as
  expect(screen.getByText('No funded vacancy confirmed')).toBeDefined();
  expect(screen.queryByText('Strong fit')).toBeNull();
 });
+it("pauses and resumes every submission from one control",async()=>{
+ const fetch=vi.fn(async(path:string)=>Response.json(path.endsWith('/home')?{...home,submissions_paused:true,max_automatic_per_day:10}:{}));vi.stubGlobal('fetch',fetch);render(<App/>);
+ expect(await screen.findByText('All submissions paused')).toBeDefined();
+ fireEvent.click(screen.getByRole('button',{name:'Resume'}));
+ await waitFor(()=>expect(fetch.mock.calls.some(c=>c[0]==='/api/home/pause'&&JSON.parse(String((c as unknown as [string,RequestInit])[1]?.body)).paused===false)).toBe(true));
+});

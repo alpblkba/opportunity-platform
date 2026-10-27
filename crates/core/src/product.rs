@@ -575,10 +575,19 @@ pub async fn dashboard(db: &Db) -> Result<Value, AppError> {
             .fetch_one(db)
             .await?;
     let questions = applications::list_review_tasks(db, None).await?;
+    let (paused, cap) = workflow::brakes(db).await?;
     let mail:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('application_id',application_id,'state',delivery_state,'error',delivery_error) from notifications where kind='submitted' order by created_at desc limit 100").fetch_all(db).await?;
     Ok(
-        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some(),"ranking_policy":RANKING_POLICY}),
+        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some(),"ranking_policy":RANKING_POLICY,"submissions_paused":paused,"max_automatic_per_day":cap}),
     )
+}
+
+/// The owner's emergency stop: refuses every submission and halts automatic preparation.
+pub async fn pause_submissions(db: &Db, paused: bool) -> Result<(), AppError> {
+    let owner = profiles::local_owner(db).await?;
+    sqlx::query("insert into product_settings(owner_id,submissions_paused) values($1,$2) on conflict(owner_id) do update set submissions_paused=$2,updated_at=now()")
+        .bind(owner).bind(paused).execute(db).await?;
+    Ok(())
 }
 
 pub async fn authorize_source(db: &Db, source_key: &str, profile_id: Uuid) -> Result<(), AppError> {
@@ -625,6 +634,25 @@ pub async fn enqueue(db: &Db, opportunity_id: Uuid) -> Result<Uuid, AppError> {
     Ok(app.id)
 }
 
+/// Hand an application to the owner: no automation will touch it again, so they are told once.
+async fn manual(db: &Db, id: Uuid, reason: &str) -> Result<(), AppError> {
+    applications::set_status(db, id, "unsupported", json!({})).await?;
+    sqlx::query("update applications set route_reason=$2 where id=$1")
+        .bind(id)
+        .bind(reason)
+        .execute(db)
+        .await?;
+    applications::notify(
+        db,
+        Some(id),
+        "manual_required",
+        &format!("manual:{id}"),
+        json!({"reason": reason}),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn process_application(db: &Db, id: Uuid) -> Result<(), AppError> {
     let app = applications::get_application(db, id).await?;
     if !["saved", "ready"].contains(&app.status.as_str()) {
@@ -648,9 +676,7 @@ pub async fn process_application(db: &Db, id: Uuid) -> Result<(), AppError> {
         .await?;
     // Real browser forms are supported only for these providers; no login or CAPTCHA bypass.
     if !["greenhouse", "lever", "ashby"].contains(&provider.as_str()) {
-        applications::set_status(db, id, "unsupported", json!({})).await?;
-        sqlx::query("update applications set route_reason='Complete this application on the employer website.' where id=$1").bind(id).execute(db).await?;
-        return Ok(());
+        return manual(db, id, "Complete this application on the employer website.").await;
     }
     let prepared = match workflow::prepare(db, id, &url).await {
         Ok(p) => p,
@@ -658,16 +684,8 @@ pub async fn process_application(db: &Db, id: Uuid) -> Result<(), AppError> {
             if error.to_string().contains("source refresh") {
                 return Ok(());
             }
-            applications::set_status(db, id, "unsupported", json!({})).await?;
-            sqlx::query("update applications set route_reason=$2 where id=$1")
-                .bind(id)
-                .bind({
-                    tracing::warn!(%error, "form unavailable");
-                    "This employer form requires manual completion.".to_owned()
-                })
-                .execute(db)
-                .await?;
-            return Ok(());
+            tracing::warn!(%error, "form unavailable");
+            return manual(db, id, "This employer form requires manual completion.").await;
         }
     };
     if prepared.plan.has_captcha
@@ -680,9 +698,12 @@ pub async fn process_application(db: &Db, id: Uuid) -> Result<(), AppError> {
             .iter()
             .any(|f| f.required && f.kind == opportunity_domain::FieldKind::Unsupported)
     {
-        applications::set_status(db, id, "unsupported", json!({})).await?;
-        sqlx::query("update applications set route_reason='The employer requires manual completion or a verification challenge.' where id=$1").bind(id).execute(db).await?;
-        return Ok(());
+        return manual(
+            db,
+            id,
+            "The employer requires manual completion or a verification challenge.",
+        )
+        .await;
     }
     if !prepared.mapping.open.is_empty() {
         return Ok(());
@@ -715,6 +736,10 @@ pub async fn tick(db: &Db) -> Result<(), AppError> {
     sqlx::query("update application_attempts set state='unknown',diagnostic='Application interrupted; receipt must be checked with the employer.',finished_at=now() where state in ('started','filled') and started_at<now()-interval '10 minutes'").execute(db).await?;
     sqlx::query("update applications set status='submission_unknown',updated_at=now() where status='submitting' and updated_at<now()-interval '10 minutes'").execute(db).await?;
     sqlx::query("update applications set status='saved',updated_at=now() where status='preparing' and updated_at<now()-interval '10 minutes' and not exists(select 1 from application_attempts t where t.application_id=applications.id and t.state in ('started','submitted','unknown'))").execute(db).await?;
+    if workflow::brakes(db).await?.0 {
+        lock.commit().await?;
+        return Ok(());
+    }
     let policy_profiles:Vec<Uuid>=sqlx::query_scalar("select distinct profile_id from authorization_policies where enabled and revoked_at is null and expires_at>now() and profile_id is not null").fetch_all(db).await?;
     for profile_id in policy_profiles {
         for job in ranked(db, profile_id)

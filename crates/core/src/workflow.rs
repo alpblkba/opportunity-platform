@@ -233,6 +233,53 @@ pub struct SubmitReport {
 /// Submit an application, if and only if an authorization permits it right now.
 ///
 /// The sequence matters and is the reason this is one function: the verdict is taken from current state, the attempt is claimed under a unique idempotency key in the same breath as spending the authorization, and only then does the browser open. A second request for the same payload finds the existing attempt and does nothing.
+/// (paused, daily cap on automatic submissions), with defaults before the owner saves any setting.
+pub async fn brakes(pool: &Db) -> Result<(bool, i32), AppError> {
+    Ok(sqlx::query_as(
+        "select coalesce(bool_or(submissions_paused), false), coalesce(min(max_automatic_per_day), 10) from product_settings",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Owner-wide brakes above every employer policy: a pause stops all submissions, and a daily cap
+/// limits automatic (policy) ones however many employers are authorized.
+pub async fn submission_brake(pool: &Db, automatic: bool) -> Result<Option<String>, AppError> {
+    let (paused, cap) = brakes(pool).await?;
+    if paused {
+        return Ok(Some("All submissions are paused by the owner.".into()));
+    }
+    if automatic {
+        let today: i64 = sqlx::query_scalar("select count(*) from application_attempts where authorization_kind='policy' and started_at > now() - interval '1 day'")
+            .fetch_one(pool)
+            .await?;
+        if today >= i64::from(cap) {
+            return Ok(Some(format!(
+                "The daily limit of {cap} automatic applications is reached."
+            )));
+        }
+    }
+    Ok(None)
+}
+
+async fn refuse_if_braked(
+    pool: &Db,
+    application_id: Uuid,
+    automatic: bool,
+) -> Result<(), AppError> {
+    let Some(reason) = submission_brake(pool, automatic).await? else {
+        return Ok(());
+    };
+    applications::record_event(
+        pool,
+        application_id,
+        "submission_refused",
+        serde_json::json!({ "reason": reason }),
+    )
+    .await?;
+    Err(AppError::Invalid(reason))
+}
+
 pub async fn submit(
     pool: &Db,
     application_id: Uuid,
@@ -240,6 +287,7 @@ pub async fn submit(
     source_key: &str,
     document_path: Option<String>,
 ) -> Result<SubmitReport, AppError> {
+    refuse_if_braked(pool, application_id, false).await?;
     // Held across the inspection, the authorization and the submission itself, so a sweep cannot start underneath a form that is halfway filled.
     let slot = claim_browser_slot(pool).await?;
     let report =
@@ -314,6 +362,8 @@ async fn submit_holding_the_machine(
         opportunity_domain::Authorization::Policy { .. } => "policy",
         _ => "token",
     };
+    // Inside the browser slot, so two automatic submissions cannot both pass the daily cap.
+    refuse_if_braked(pool, application_id, kind == "policy").await?;
     let (attempt, newly) =
         applications::begin_attempt(pool, application_id, url, &hash, kind, policy_id, token_id)
             .await?;

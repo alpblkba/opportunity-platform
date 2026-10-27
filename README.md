@@ -8,4 +8,4 @@ Automatic applications require an explicit employer/profile authorization in the
 
 For email notifications, configure `MAIL_API_KEY`, `MAIL_FROM`, and `MAIL_TO` in the ignored `.env`. The default delivery API is Resend; `MAIL_API_URL` can point to a compatible transport. Acceptance is recorded separately from provider-confirmed delivery. No notification credentials are included.
 
-Focused browser/API verification: `node scripts/test-product.mjs`. It uses an isolated local PostgreSQL database, a synthetic CV, real public listings and loopback-only application/mail fixtures. Real applications and real recipient emails are never sent by this test.
+Product acceptance journey: `TEST_OFFLINE=1 node scripts/test-product.mjs` (run in CI). It uses an isolated PostgreSQL database, a synthetic CV and ranking corpus, and loopback-only application/mail fixtures, with every source disabled. Without `TEST_OFFLINE` it also waits for live discovery from real public listings, as a smoke test. Real applications and real recipient emails are never sent. Ranking rules: [docs/RANKING_POLICY.md](docs/RANKING_POLICY.md).

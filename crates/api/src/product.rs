@@ -16,6 +16,7 @@ pub fn router() -> Router<AppState> {
         .route("/home/authorize", post(authorize))
         .route("/home/apply/{id}", post(apply))
         .route("/home/answer/{id}", post(answer))
+        .route("/home/pause", post(pause))
 }
 async fn home(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(product::dashboard(&s.db).await?))
@@ -45,6 +46,17 @@ async fn authorize(
 }
 async fn apply(State(s): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<Value>, ApiError> {
     Ok(Json(json!({"id":product::enqueue(&s.db,id).await?})))
+}
+#[derive(Deserialize)]
+struct PauseBody {
+    paused: bool,
+}
+async fn pause(
+    State(s): State<AppState>,
+    Json(b): Json<PauseBody>,
+) -> Result<Json<Value>, ApiError> {
+    product::pause_submissions(&s.db, b.paused).await?;
+    Ok(Json(json!({"ok":true})))
 }
 #[derive(Deserialize)]
 struct AnswerBody {

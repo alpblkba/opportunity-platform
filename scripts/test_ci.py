@@ -73,6 +73,13 @@ class VerificationTests(unittest.TestCase):
                 self.tap.write_text(PASSING_TAP.replace("tests 1", f"tests {total}").replace("pass 1", f"pass {passed}"))
                 self.assertNotEqual(self.run_script().returncode, 0)
 
+    def test_spec_summary_from_newer_node_is_checked_just_as_strictly(self):
+        spec = PASSING_TAP.replace("# ", "\u2139 ")
+        self.tap.write_text(spec, encoding="utf-8")
+        self.assertEqual(self.run_script().returncode, 0)
+        self.tap.write_text(spec.replace("fail 0", "fail 1"), encoding="utf-8")
+        self.assertNotEqual(self.run_script().returncode, 0)
+
     def test_missing_test_summary_fails(self):
         self.tap.write_text("no test summary\n")
         self.assertNotEqual(self.run_script().returncode, 0)

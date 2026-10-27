@@ -1583,3 +1583,65 @@ async fn manual_tracking_persists_notes_and_owner_history_without_a_submission_a
         .is_err());
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_owner_pause_and_daily_cap_refuse_submissions_above_every_policy() {
+    let db = require_db!();
+    let application = application_ready_to_submit(&db.pool, "Firmware Engineer").await;
+    assert!(workflow::submission_brake(&db.pool, true)
+        .await
+        .unwrap()
+        .is_none());
+
+    opportunity_core::product::pause_submissions(&db.pool, true)
+        .await
+        .unwrap();
+    // Refused before the browser slot: no worker exists in this test and no attempt is begun.
+    let error = workflow::submit(
+        &db.pool,
+        application,
+        "http://127.0.0.1:8099/apply/single",
+        "mock",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("paused"), "{error}");
+    let attempts: i64 = sqlx::query_scalar("select count(*) from application_attempts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 0);
+    let refused: i64 = sqlx::query_scalar(
+        "select count(*) from application_events where application_id=$1 and kind='submission_refused'",
+    )
+    .bind(application)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(refused, 1);
+
+    // The cap counts real automatic attempts across all employers; owner-approved one-offs are not automatic.
+    opportunity_core::product::pause_submissions(&db.pool, false)
+        .await
+        .unwrap();
+    sqlx::query("update product_settings set max_automatic_per_day=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("insert into application_attempts (application_id,idempotency_key,destination,payload_hash,authorization_kind) values ($1,'cap-test','http://127.0.0.1:8099/apply/single','hash','policy')")
+        .bind(application)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let reason = workflow::submission_brake(&db.pool, true)
+        .await
+        .unwrap()
+        .expect("the cap is reached");
+    assert!(reason.contains("daily limit of 1"), "{reason}");
+    assert!(workflow::submission_brake(&db.pool, false)
+        .await
+        .unwrap()
+        .is_none());
+    db.cleanup().await;
+}

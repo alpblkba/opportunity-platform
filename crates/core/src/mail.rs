@@ -26,7 +26,7 @@ pub async fn dispatch(db: &Db) -> anyhow::Result<()> {
     sqlx::query("update notifications set delivery_state='failed',delivery_error='Delivery could not be confirmed; automatic retry stopped to prevent duplicate email.' where delivery_receipt is null and first_attempt_at<now()-interval '23 hours' and delivered_at is null")
         .execute(db).await?;
     let mut tx = db.begin().await?;
-    let rows:Vec<(Uuid,String,Value,Option<String>)>=sqlx::query_as("select n.id,n.kind,jsonb_build_object('employer',org.display_name,'position',o.canonical_title,'url',(select p.url from postings p where p.opportunity_id=o.id order by p.url limit 1),'time',n.created_at,'detail',n.payload),n.delivery_receipt from notifications n join applications a on a.id=n.application_id join opportunities o on o.id=a.opportunity_id join organizations org on org.id=o.organization_id where n.kind in ('submitted','action_required') and n.delivered_at is null and n.delivery_state not in ('bounced','failed') and (n.last_attempt_at is null or n.last_attempt_at<now()-interval '1 minute') order by n.created_at for update of n skip locked limit 5").fetch_all(&mut *tx).await?;
+    let rows:Vec<(Uuid,String,Value,Option<String>)>=sqlx::query_as("select n.id,n.kind,jsonb_build_object('employer',org.display_name,'position',o.canonical_title,'url',(select p.url from postings p where p.opportunity_id=o.id order by p.url limit 1),'time',n.created_at,'detail',n.payload),n.delivery_receipt from notifications n join applications a on a.id=n.application_id join opportunities o on o.id=a.opportunity_id join organizations org on org.id=o.organization_id where n.kind in ('submitted','action_required','submission_uncertain','failed','manual_required') and n.delivered_at is null and n.delivery_state not in ('bounced','failed') and (n.last_attempt_at is null or n.last_attempt_at<now()-interval '1 minute') order by n.created_at for update of n skip locked limit 5").fetch_all(&mut *tx).await?;
     // Persist the attempt before network I/O: a process crash must not reset the retry window.
     for (id, _, _, _) in &rows {
         sqlx::query("update notifications set first_attempt_at=coalesce(first_attempt_at,now()),last_attempt_at=now() where id=$1")
@@ -42,8 +42,8 @@ pub async fn dispatch(db: &Db) -> anyhow::Result<()> {
             }
             let employer=info["employer"].as_str().unwrap_or("");
             let position=info["position"].as_str().unwrap_or("");
-            let status=if kind=="submitted"{"Confirmed submitted"}else{"Your answer is needed"};
-            let body=json!({"from":from,"to":[to],"subject":format!("{status}: {position} at {employer}"),"text":format!("{status}\nEmployer: {employer}\nPosition: {position}\nApplication: {}\nTime: {}\n{}",info["url"].as_str().unwrap_or(""),info["time"].as_str().unwrap_or(""),if kind=="submitted"{"The employer confirmed receipt."}else{"Open Opportunities to answer the employer's questions."})});
+            let (status,hint)=wording(&kind);
+            let body=json!({"from":from,"to":[to],"subject":format!("{status}: {position} at {employer}"),"text":format!("{status}\nEmployer: {employer}\nPosition: {position}\nApplication: {}\nTime: {}\n{hint}",info["url"].as_str().unwrap_or(""),info["time"].as_str().unwrap_or(""))});
             let response=client.post(format!("{base}/emails")).bearer_auth(&key).header("Idempotency-Key",id.to_string()).json(&body).send().await?.error_for_status()?.json::<Value>().await?;
             let receipt=response["id"].as_str().ok_or_else(||anyhow::anyhow!("Email provider returned no message identifier"))?;
             // Acceptance is not delivery. A later status read must confirm delivered.
@@ -65,4 +65,33 @@ pub async fn dispatch(db: &Db) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Subject status and next step per notification kind. Anything that needs the owner says what to do.
+fn wording(kind: &str) -> (&'static str, &'static str) {
+    match kind {
+        "submitted" => ("Confirmed submitted", "The employer confirmed receipt."),
+        "submission_uncertain" => ("Check with the employer", "The form may have been sent, but no confirmation was seen. It will not be retried; check with the employer before applying again."),
+        "failed" => ("Application failed", "Nothing was confirmed as sent. Open Opportunities to retry it."),
+        "manual_required" => ("Complete on the employer website", "Automation cannot finish this form. Open Opportunities for the employer link."),
+        _ => ("Your answer is needed", "Open Opportunities to answer the employer's questions."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_kind_that_needs_the_owner_has_its_own_subject() {
+        let subjects: std::collections::HashSet<_> = [
+            "submitted",
+            "action_required",
+            "submission_uncertain",
+            "failed",
+            "manual_required",
+        ]
+        .iter()
+        .map(|k| super::wording(k).0)
+        .collect();
+        assert_eq!(subjects.len(), 5);
+    }
 }
