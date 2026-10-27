@@ -1695,13 +1695,13 @@ async fn a_profile_survives_a_restart_with_every_field_intact() {
 }
 
 #[tokio::test]
-async fn the_four_starting_profiles_seed_once_and_carry_no_personal_data() {
+async fn the_five_starting_profiles_seed_once_and_carry_no_personal_data() {
     let db = require_db!();
     let created = profiles::seed_default_profiles(&db.pool).await.unwrap();
     assert_eq!(
         created.len(),
-        4,
-        "the contract asks for four tracks: {created:?}"
+        5,
+        "the product has five career tracks: {created:?}"
     );
 
     let all = profiles::list(&db.pool).await.unwrap();
@@ -1742,7 +1742,7 @@ async fn the_four_starting_profiles_seed_once_and_carry_no_personal_data() {
         .await
         .unwrap()
         .is_empty());
-    assert_eq!(profiles::list(&db.pool).await.unwrap().len(), 4);
+    assert_eq!(profiles::list(&db.pool).await.unwrap().len(), 5);
     assert_eq!(
         profiles::get(&db.pool, all[0].id)
             .await

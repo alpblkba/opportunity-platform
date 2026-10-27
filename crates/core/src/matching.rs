@@ -14,7 +14,7 @@ use crate::embeddings::{self, EmbeddingProvider, SemanticStatus};
 use crate::profiles::{self, ProfileError};
 
 /// How many opportunities are pulled from the database before scoring. Bounded because the whole shortlist is held in memory with its descriptions, which on a 1 GiB host is the largest single allocation this process makes. When the corpus outgrows it the ranking says so rather than quietly scoring a subset.
-const SHORTLIST: i64 = 2000;
+const SHORTLIST: i64 = 10000;
 
 fn shortlist_limit() -> i64 {
     std::env::var("MATCH_SHORTLIST")
@@ -78,7 +78,10 @@ pub struct MatchQuery {
 }
 
 /// Load the corpus a profile should be scored against. Deliberately not filtered by location or kind: those are the matcher's decisions and must come with a stated reason, not a silent omission.
-async fn shortlist(pool: &Db, query: &MatchQuery) -> Result<Vec<ScoredRow>, sqlx::Error> {
+pub(crate) async fn shortlist(
+    pool: &Db,
+    query: &MatchQuery,
+) -> Result<Vec<ScoredRow>, sqlx::Error> {
     sqlx::query_as::<_, ScoredRow>(
         "select o.id, o.canonical_title, org.display_name as organization, o.kind, o.advertised_state,
                 o.country_code, o.city, o.remote_raw, o.deadline_at, o.supervisor,
@@ -92,7 +95,7 @@ async fn shortlist(pool: &Db, query: &MatchQuery) -> Result<Vec<ScoredRow>, sqlx
          join organizations org on org.id = o.organization_id
          left join postings p on p.opportunity_id = o.id and p.closed_at is null
          left join sources s on s.id = p.source_id
-         where o.closed_at is null
+         where o.closed_at is null and (o.deadline_at is null or o.deadline_at > now())
            and ($1::text is null or o.search_vector @@ websearch_to_tsquery('simple', $1))
          group by o.id, org.display_name
          order by o.last_seen_at desc, o.id

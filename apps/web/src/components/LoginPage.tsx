@@ -46,8 +46,8 @@ export default function LoginPage({ expired = false, onSignedIn }: Props) {
         <p className="login-prompt" aria-hidden="true">
           alpblkba@opportunities:~$
         </p>
-        <h1 id="login-heading">Alp&apos;s Opportunity Platform</h1>
-        <p className="login-sub">Private. One account. Everything here belongs to its owner.</p>
+        <h1 id="login-heading">Opportunities</h1>
+        <p className="login-sub">Sign in to your job search.</p>
 
         {expired && !error && (
           <p className="notice" role="status">

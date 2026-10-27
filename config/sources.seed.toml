@@ -123,3 +123,15 @@ enabled = true
 refresh_hours = 24
 tags = ["academic", "germany", "potsdam", "research"]
 notes = "shared career site: rows for affiliated Plattner Foundation entities also appear"
+
+# Public listing endpoint verified during local product development.
+[[sources]]
+key = "nvidia-workday"
+kind = "workday"
+organization = "NVIDIA"
+tenant = "nvidia"
+instance = "wd5"
+site = "NVIDIAExternalCareerSite"
+enabled = true
+refresh_hours = 12
+tags = ["gpu", "systems", "silicon"]

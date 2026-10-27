@@ -7,6 +7,7 @@ license.workspace = true
 description = "Loopback HTTP API for the opportunity platform."
 
 [dependencies]
+sha2.workspace = true
 opportunity-adapters.workspace = true
 opportunity-core.workspace = true
 opportunity-domain.workspace = true

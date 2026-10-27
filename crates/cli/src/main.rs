@@ -266,8 +266,10 @@ async fn serve(
     if web_dist.is_none() {
         tracing::warn!("no built frontend found; serving the API only. Run `npm --prefix apps/web run build` to serve the UI from this process.");
     }
+    opportunity_core::product::initialize(&db).await?;
     let http = HttpClient::new()?;
     if scheduler_enabled {
+        opportunity_core::product::spawn(db.clone());
         // State lives in the database, so this resumes the previous process's schedule rather than restarting it.
         opportunity_core::scheduler::spawn(db.clone(), http.clone());
         println!("background refresh is on; each source follows its own refresh_hours cadence");

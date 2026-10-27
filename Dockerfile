@@ -41,8 +41,8 @@ FROM debian:bookworm-slim AS runtime
 ARG GIT_REVISION
 LABEL org.opencontainers.image.revision=$GIT_REVISION \
       org.opencontainers.image.title="opportunity-runtime"
-# ca-certificates is needed to read job boards over TLS; curl is the health check.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+# ca-certificates is needed to read job boards over TLS; curl is the health check; poppler-utils provides pdftotext for PDF CVs.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 # An unprivileged user owns the private tree, which holds the CV and browser artefacts.
 RUN useradd --system --create-home --uid 10001 opportunity
@@ -66,7 +66,7 @@ CMD ["serve"]
 #
 # The browser is installed by the same Playwright package that will drive it, rather than taken from a prebuilt browser image. Playwright pins an exact browser build per release, so a base image tagged for one version and a lockfile resolving to another produce an image with a browser in it and no browser it can use: `Executable doesn't exist at /ms-playwright/chromium_headless_shell-1248`. Installing from the resolved package makes that mismatch impossible, and brings only Chromium instead of Chromium, Firefox and WebKit.
 FROM node:22-bookworm-slim AS browser
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --create-home --uid 10001 opportunity
 WORKDIR /app

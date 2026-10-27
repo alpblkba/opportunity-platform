@@ -40,7 +40,6 @@ pub fn router() -> Router<AppState> {
         .route("/policies", get(list_policies).post(create_policy))
         .route("/policies/{id}/state", post(set_policy_state))
         .route("/notifications", get(list_notifications))
-        .route("/notifications/{id}/delivered", post(mark_delivered))
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,7 +153,7 @@ struct FormBody {
     #[serde(default)]
     source_key: Option<String>,
     #[serde(default)]
-    document_path: Option<String>,
+    _document_path: Option<String>,
 }
 
 async fn prepare(
@@ -201,7 +200,16 @@ async fn authorize_submit(
     let mapping = opportunity_domain::map_form(&plan, &facts, &answers);
     // Through the same settling step submit uses, or the token would authorize a different payload than the one that gets sent.
     let mapping = workflow::with_answers(&state.db, id, mapping).await?;
-    let hash = workflow::payload_hash(&workflow::payload_for(&mapping));
+    use sha2::{Digest, Sha256};
+    let document_hash = opportunity_core::documents::current_path(&state.db)
+        .await?
+        .map(|p| std::fs::read(p).map(|bytes| format!("{:x}", Sha256::digest(bytes))))
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("Stored CV unavailable".into()))?;
+    let hash = workflow::payload_hash_with_document(
+        &workflow::payload_for(&mapping),
+        document_hash.as_deref(),
+    );
     let token_id = applications::issue_token(
         &state.db,
         id,
@@ -228,7 +236,14 @@ async fn submit(
         ApiError::BadRequest("source_key is required so a policy can be matched against it".into())
     })?;
     Ok(Json(
-        workflow::submit(&state.db, id, &body.url, &source_key, body.document_path).await?,
+        workflow::submit(
+            &state.db,
+            id,
+            &body.url,
+            &source_key,
+            opportunity_core::documents::current_path(&state.db).await?,
+        )
+        .await?,
     ))
 }
 
@@ -308,12 +323,4 @@ async fn list_notifications(
     Ok(Json(
         applications::list_notifications(&state.db, params.undelivered_only).await?,
     ))
-}
-
-async fn mark_delivered(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
-    applications::mark_delivered(&state.db, id).await?;
-    Ok(StatusCode::NO_CONTENT)
 }

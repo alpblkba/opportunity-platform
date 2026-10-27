@@ -37,6 +37,10 @@ pub struct FillRequest {
     #[serde(rename = "documentPath", skip_serializing_if = "Option::is_none")]
     pub document_path: Option<String>,
     pub reference: String,
+    #[serde(rename = "standingAuthorized")]
+    pub standing_authorized: bool,
+    #[serde(rename = "documentHash", skip_serializing_if = "Option::is_none")]
+    pub document_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,6 +121,7 @@ async fn run<T: for<'de> Deserialize<'de>>(
     let mut child = Command::new("node")
         .arg(&entry)
         .arg(command)
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,10 +136,13 @@ async fn run<T: for<'de> Deserialize<'de>>(
             .map_err(|e| WorkerError::Failed(e.to_string()))?;
         stdin.shutdown().await.ok();
     }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| WorkerError::Failed(e.to_string()))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| WorkerError::Failed("The employer form timed out.".into()))?
+    .map_err(|e| WorkerError::Failed(e.to_string()))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
     // The worker reports its own errors as JSON so a navigation refusal reads as a refusal rather than as a crash.

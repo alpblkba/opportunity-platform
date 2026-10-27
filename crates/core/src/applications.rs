@@ -335,6 +335,7 @@ pub struct ReviewTask {
     pub field_name: String,
     pub question_text: String,
     pub field_type: String,
+    pub options: serde_json::Value,
     pub required: bool,
     pub sensitive: bool,
     pub draft_answer: Option<String>,
@@ -351,15 +352,18 @@ pub async fn upsert_review_tasks(
     questions: &[opportunity_domain::OpenQuestion],
 ) -> Result<usize, AppError> {
     let mut tx = pool.begin().await?;
+    let fields: Vec<String> = questions.iter().map(|q| q.field.clone()).collect();
+    sqlx::query("update review_tasks set status='dismissed' where application_id=$1 and status='open' and not(field_name=any($2))").bind(application_id).bind(&fields).execute(&mut *tx).await?;
     for question in questions {
         sqlx::query(
-            "insert into review_tasks (application_id, field_name, question_text, field_type, required, sensitive, draft_answer)
-             values ($1,$2,$3,$4,$5,$6,$7)
+            "insert into review_tasks (application_id, field_name, question_text, field_type, required, sensitive, draft_answer, options)
+             values ($1,$2,$3,$4,$5,$6,$7,$8)
              on conflict (application_id, field_name) do update set
                 question_text = excluded.question_text,
                 required = excluded.required,
                 sensitive = excluded.sensitive,
-                draft_answer = excluded.draft_answer",
+                draft_answer = excluded.draft_answer, options = excluded.options,
+                status = case when review_tasks.question_text <> excluded.question_text or review_tasks.options <> excluded.options or review_tasks.sensitive <> excluded.sensitive then 'open' else review_tasks.status end",
         )
         .bind(application_id)
         .bind(&question.field)
@@ -368,6 +372,7 @@ pub async fn upsert_review_tasks(
         .bind(question.required)
         .bind(question.sensitive)
         .bind(question.draft.as_deref())
+        .bind(serde_json::to_value(&question.options)?)
         .execute(&mut *tx)
         .await?;
     }
@@ -381,7 +386,7 @@ pub async fn list_review_tasks(
 ) -> Result<Vec<ReviewTask>, AppError> {
     Ok(sqlx::query_as::<_, ReviewTask>(
         "select id, application_id, field_name, question_text, field_type, required, sensitive,
-                draft_answer, answer, status, created_at, resolved_at
+                draft_answer, answer, status, created_at, resolved_at, options
          from review_tasks
          where ($1::uuid is null or application_id = $1) and status = 'open'
          order by created_at",
@@ -396,11 +401,23 @@ pub async fn answer_review_task(pool: &Db, id: Uuid, answer: &str) -> Result<Rev
     if answer.trim().is_empty() {
         return Err(AppError::Invalid("an answer cannot be empty".into()));
     }
+    let options: serde_json::Value =
+        sqlx::query_scalar("select options from review_tasks where id=$1")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+    if let Some(choices) = options.as_array() {
+        if !choices.is_empty() && !choices.iter().any(|v| v.as_str() == Some(answer.trim())) {
+            return Err(AppError::Invalid(
+                "Choose one of the employer's listed answers.".into(),
+            ));
+        }
+    }
     let task = sqlx::query_as::<_, ReviewTask>(
         "update review_tasks set answer = $2, status = 'answered', resolved_at = now()
          where id = $1
          returning id, application_id, field_name, question_text, field_type, required, sensitive,
-                   draft_answer, answer, status, created_at, resolved_at",
+                   draft_answer, answer, status, created_at, resolved_at, options",
     )
     .bind(id)
     .bind(answer.trim())
@@ -505,6 +522,7 @@ pub async fn mark_delivered(pool: &Db, id: Uuid) -> Result<(), AppError> {
 pub struct StoredPolicy {
     pub id: Uuid,
     pub name: String,
+    pub profile_id: Option<Uuid>,
     pub enabled: bool,
     pub source_keys: Vec<String>,
     pub require_all_fields_mapped: bool,
@@ -531,7 +549,8 @@ pub struct NewPolicy {
     pub expires_in_days: Option<i64>,
 }
 
-const POLICY_COLUMNS: &str = "id, name, enabled, source_keys, require_all_fields_mapped,
+const POLICY_COLUMNS: &str =
+    "id, name, profile_id, enabled, source_keys, require_all_fields_mapped,
     forbid_sensitive_questions, forbid_free_text, max_per_day, max_total, submissions_made,
     expires_at, revoked_at, created_at";
 
@@ -663,7 +682,7 @@ pub async fn decide_authorization(
     } = *context;
     // Any attempt that is not an outright failure blocks a further one. An uncertain outcome counts, which is what stops a blind retry.
     let already_attempted: bool = sqlx::query_scalar(
-        "select exists (select 1 from application_attempts where application_id = $1 and state in ('submitted','unknown'))",
+        "select exists (select 1 from application_attempts where application_id = $1 and state in ('submitted','unknown','started'))",
     )
     .bind(application_id)
     .fetch_one(pool)
@@ -678,7 +697,14 @@ pub async fn decide_authorization(
     .fetch_optional(pool)
     .await?;
 
-    let policy_rows = list_policies(pool).await?;
+    let profile_id = get_application(pool, application_id).await?.profile_id;
+    let destination_matches: bool = sqlx::query_scalar("select exists(select 1 from postings p join sources s on s.id=p.source_id join applications a on a.opportunity_id=p.opportunity_id where a.id=$1 and p.url=$2 and s.key=$3 and p.closed_at is null)")
+        .bind(application_id).bind(destination).bind(source_key).fetch_one(pool).await?;
+    let policy_rows: Vec<_> = list_policies(pool)
+        .await?
+        .into_iter()
+        .filter(|p| p.profile_id.is_none() || (p.profile_id == profile_id && destination_matches))
+        .collect();
     // Counted per policy, so one policy's activity cannot exhaust another's daily allowance.
     let today: Vec<(Uuid, i64)> = sqlx::query_as(
         "select policy_id, count(*) from application_attempts

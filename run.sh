@@ -42,6 +42,10 @@ echo "building the frontend"
 npm --prefix apps/web ci --silent
 npm --prefix apps/web run build --silent
 
+echo "building the local application worker"
+npm --prefix apps/browser-worker ci --silent
+npm --prefix apps/browser-worker run build --silent
+
 echo "building the server"
 cargo build --release --bin opportunity
 

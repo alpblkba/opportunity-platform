@@ -66,18 +66,24 @@ pub async fn with_answers(
     let mut still_open = Vec::new();
     for question in std::mem::take(&mut mapping.open) {
         match answered.iter().find(|(field, _)| *field == question.field) {
-            Some((_, answer)) => mapping.mapped.push(MappedField {
-                field: question.field,
-                label: question.label,
-                value: answer.clone(),
-                source: "your answer in the review queue".into(),
-            }),
-            None => still_open.push(question),
+            Some((_, answer)) if question.kind != opportunity_domain::FieldKind::Unsupported => {
+                mapping.mapped.push(MappedField {
+                    field: question.field,
+                    label: question.label,
+                    value: answer.clone(),
+                    source: "your answer in the review queue".into(),
+                })
+            }
+            _ => still_open.push(question),
         }
     }
     mapping.open = still_open;
 
-    if mapping.route == Route::Review && mapping.open.is_empty() {
+    if (mapping.route == Route::Review || mapping.route == Route::Curated)
+        && mapping.open.is_empty()
+        && !mapping.reason.contains("challenge")
+        && !mapping.reason.contains("signing in")
+    {
         mapping.route = Route::Auto;
         mapping.reason = format!(
             "every one of the {} fields maps to something you approved or answered",
@@ -95,6 +101,7 @@ pub async fn prepare(
     application_id: Uuid,
     url: &str,
 ) -> Result<PrepareResult, AppError> {
+    let slot = claim_browser_slot(pool).await?;
     let was = applications::get_application(pool, application_id)
         .await?
         .status;
@@ -106,7 +113,6 @@ pub async fn prepare(
     )
     .await?;
 
-    let slot = claim_browser_slot(pool).await?;
     let inspected = worker::inspect(url).await;
     slot.release().await;
     let plan = match inspected {
@@ -198,6 +204,19 @@ pub fn payload_hash(values: &[worker::FillValue]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+pub fn payload_hash_with_document(
+    values: &[worker::FillValue],
+    document_hash: Option<&str>,
+) -> String {
+    match document_hash {
+        None => payload_hash(values),
+        Some(hash) => format!(
+            "{:x}",
+            Sha256::digest(format!("{}\ncv={hash}", payload_hash(values)).as_bytes())
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubmitReport {
     pub application_id: Uuid,
@@ -239,10 +258,20 @@ async fn submit_holding_the_machine(
     let plan = worker::inspect(url)
         .await
         .map_err(|e| AppError::Invalid(worker_message(&e)))?;
+    if plan.has_captcha
+        || plan.requires_login
+        || plan.fields.is_empty()
+        || plan.submit_selector.is_none()
+    {
+        return Err(AppError::Invalid(
+            "This form requires manual completion.".into(),
+        ));
+    }
     let facts = applications::approved_facts(pool).await?;
     let answers = applications::approved_answers(pool).await?;
     let mapping = map_form(&plan, &facts, &answers);
     // Whether the form asked for personal writing is a property of the form, not of what is still unanswered, so a policy that forbids free text keeps refusing after the owner has written it.
+    applications::upsert_review_tasks(pool, application_id, &mapping.open).await?;
     let has_free_text = mapping
         .open
         .iter()
@@ -250,7 +279,12 @@ async fn submit_holding_the_machine(
     let mapping = with_answers(pool, application_id, mapping).await?;
 
     let values = payload_for(&mapping);
-    let hash = payload_hash(&values);
+    let document_hash = document_path
+        .as_ref()
+        .map(|p| std::fs::read(p).map(|bytes| format!("{:x}", Sha256::digest(bytes))))
+        .transpose()
+        .map_err(|_| AppError::Invalid("The stored CV is unavailable. Please update it.".into()))?;
+    let hash = payload_hash_with_document(&values, document_hash.as_deref());
 
     let context = applications::AuthorizationContext {
         application_id,
@@ -316,6 +350,8 @@ async fn submit_holding_the_machine(
             values,
             document_path,
             reference,
+            standing_authorized: true,
+            document_hash,
         },
         authorized_payload_hash: hash.clone(),
         progress_path: marker.display().to_string(),

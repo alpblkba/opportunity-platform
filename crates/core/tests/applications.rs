@@ -540,6 +540,60 @@ async fn missing_or_revoked_authorization_prevents_submission() {
 }
 
 #[tokio::test]
+async fn product_policy_is_bound_to_the_discovered_destination_and_profile() {
+    let db = require_db!();
+    profiles::seed_default_profiles(&db.pool).await.unwrap();
+    let profile = profiles::get_by_key(&db.pool, "memory")
+        .await
+        .unwrap()
+        .unwrap();
+    let opportunity = seed_opportunity(&db.pool, "Memory engineer").await;
+    let app = applications::create_application(&db.pool, opportunity, Some(profile.id))
+        .await
+        .unwrap();
+    let policy = enabled_policy(&db.pool, "example-greenhouse").await;
+    sqlx::query("update authorization_policies set profile_id=$2 where id=$1")
+        .bind(policy)
+        .bind(profile.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut ctx = context(app.id, "example-greenhouse", "payload", Route::Auto).await;
+    assert!(!applications::decide_authorization(&db.pool, &ctx)
+        .await
+        .unwrap()
+        .0
+        .is_permitted());
+    let source: Uuid = sqlx::query_scalar("insert into sources(key,display_name,kind,endpoint) values('example-greenhouse','Example','greenhouse','{\"kind\":\"greenhouse\",\"board_token\":\"example\"}') returning id")
+        .fetch_one(&db.pool).await.unwrap();
+    sqlx::query("insert into postings(source_id,native_id,opportunity_id,url,title,content_hash) values($1,'example',$2,$3,'Memory engineer','example')")
+        .bind(source).bind(opportunity).bind(ctx.destination).execute(&db.pool).await.unwrap();
+    assert!(applications::decide_authorization(&db.pool, &ctx)
+        .await
+        .unwrap()
+        .0
+        .is_permitted());
+    ctx.destination = "https://job-boards.greenhouse.io/another-employer/jobs/123";
+    assert!(!applications::decide_authorization(&db.pool, &ctx)
+        .await
+        .unwrap()
+        .0
+        .is_permitted());
+    ctx.destination = "http://127.0.0.1:8099/apply/single";
+    sqlx::query("update applications set profile_id=null where id=$1")
+        .bind(app.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(!applications::decide_authorization(&db.pool, &ctx)
+        .await
+        .unwrap()
+        .0
+        .is_permitted());
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn an_individual_token_is_one_use_and_bound_to_its_payload() {
     let db = require_db!();
     approved_identity_facts(&db.pool).await;
@@ -990,7 +1044,7 @@ async fn profiles_and_discovery_from_earlier_sessions_still_work_alongside_appli
     let db = require_db!();
     // Session 3 behaviour must survive the session 4 migration.
     let created = profiles::seed_default_profiles(&db.pool).await.unwrap();
-    assert_eq!(created.len(), 4);
+    assert_eq!(created.len(), 5);
     let mut profile = Profile::blank("custom", "Custom");
     profile.terms = vec!["DRAM".into()];
     let stored = profiles::create(&db.pool, profile).await.unwrap();
@@ -1002,7 +1056,7 @@ async fn profiles_and_discovery_from_earlier_sessions_still_work_alongside_appli
             .terms,
         vec!["DRAM"]
     );
-    assert_eq!(profiles::list(&db.pool).await.unwrap().len(), 5);
+    assert_eq!(profiles::list(&db.pool).await.unwrap().len(), 6);
     db.cleanup().await;
 }
 

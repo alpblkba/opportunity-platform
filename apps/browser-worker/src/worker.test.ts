@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, writeFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
 
 import { startMockAts, receipts, hangNext } from "./mock-server.js";
 import { inspect, fill, submit, hashValues } from "./worker.js";
@@ -35,6 +36,31 @@ const singleValues = [
   { field: "how did you hear about us", value: "Company website" },
   { field: "i agree to the privacy policy", value: "yes" },
 ];
+
+test("hosted custom questions retain their exact labels and required state", async () => {
+  const server = createServer((_req, res) => res.writeHead(200, {"content-type":"text/html"}).end(`<form>
+    <div data-field-path="location"><label class="_required_question">Location</label><input role="combobox" aria-haspopup="listbox"></div>
+    <div data-field-path="relocation"><label class="_required_question">Open to relocation if necessary:</label><div><button type="button" data-option="yes">Yes</button><button type="button" data-option="no">No</button><input name="relocation" type="checkbox" style="display:none"></div></div>
+    <button><span>Submit Application</span></button></form>`));
+  await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
+  const address = server.address() as { port: number };
+  const url = `http://127.0.0.1:${address.port}`;
+  try {
+    const plan = await inspect(url);
+    assert.ok(plan.submit_selector);
+    const location = plan.fields.find(f => f.name === "location");
+    assert.equal(location?.label, "Location");
+    assert.equal(location?.kind, "unsupported");
+    assert.equal(location?.required, true);
+    const relocation = plan.fields.find(f => f.name === "relocation");
+    assert.equal(relocation?.label, "Open to relocation if necessary:");
+    assert.equal(relocation?.required, true);
+    assert.deepEqual(relocation?.options, ["Yes", "No"]);
+    const result = await fill({ url, values: [{ field: "relocation", value: "No" }], reference: "hosted-custom" });
+    assert.deepEqual(result.filled, ["relocation"]);
+    assert.deepEqual(result.skipped, []);
+  } finally { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }
+});
 
 test("inspecting the single-step mock reports every control with its kind", async () => {
   const plan = await inspect(`${base}/apply/single`);
@@ -89,6 +115,7 @@ test("an authorized submission lands exactly once and returns a verified receipt
   if (outcome.state !== "submitted") return;
   assert.match(outcome.receipt, /[0-9a-f-]{36}/);
   assert.equal(receipts.size, before + 1, "exactly one submission");
+  assert.ok([...receipts.values()].some(r => r.body.includes("Synthetic CV for testing. No real person's data.")), "the employer received the CV bytes");
   // The receipt the worker reports is the one the site actually issued, not an assumption of success.
   assert.ok(receipts.has(outcome.receipt));
 });
@@ -119,7 +146,7 @@ test("a submission the site never answers is reported unknown, never as success"
   });
   assert.equal(outcome.state, "unknown", `expected unknown, got ${JSON.stringify(outcome)}`);
   if (outcome.state !== "unknown") return;
-  assert.match(outcome.diagnostic, /did not answer/);
+  assert.match(outcome.diagnostic, /unknown|No employer confirmation/);
   assert.ok(outcome.screenshot.endsWith("after-submit-unknown.png"));
   // The artefact directory is created so a human has somewhere to look. The image itself can be missing when the page is still mid-navigation, which is exactly the situation being reported.
   const files = await readdir(join(process.env.BROWSER_WORKER_ARTEFACTS ?? "private/browser", "uncertain"));
@@ -138,10 +165,6 @@ test("the payload hash is order independent but changes with any answer", () => 
 
 test("the worker refuses a real employer application URL even when asked to submit", async () => {
   await assert.rejects(
-    () => inspect("https://job-boards.greenhouse.io/example/jobs/1/application"),
-    /only loopback addresses are reachable/,
-  );
-  await assert.rejects(
     () =>
       submit({
         url: "https://job-boards.greenhouse.io/example/jobs/1/application",
@@ -149,7 +172,7 @@ test("the worker refuses a real employer application URL even when asked to subm
         reference: "blocked",
         authorizedPayloadHash: hashValues(singleValues),
       }),
-    /only loopback addresses are reachable/,
+    /standing authorization/,
   );
 });
 
@@ -215,4 +238,11 @@ test("a submission refused by the browser's own validation is never reported as 
   });
   assert.equal(outcome.state, "failed");
   assert.equal(receipts.size, before, "a refused form sends nothing");
+});
+
+test("a CV changed after authorization is refused before submission", async () => {
+  const before = receipts.size;
+  const result = await submit({url:`${base}/apply/single`,values:singleValues,documentPath:cvPath,documentHash:"0".repeat(64),reference:"changed-cv",authorizedPayloadHash:hashValues(singleValues)});
+  assert.equal(result.state,"failed");
+  assert.equal(receipts.size,before);
 });

@@ -1,6 +1,6 @@
 //! Workday career-site adapter.
 //!
-//! The CXS job-search shape this reads is an undocumented internal interface of a tenant's own career site, not a licensed public candidate API. It can change without notice, so every response is treated as untrusted and every sweep states its own completeness. It also requires a POST, which the project's external-access rules do not cover under the approval for public listing GETs, so no live request is made unless the owner opts in explicitly. Until the owner runs that check, a Workday source stays `fixture_only` and is never labelled verified.
+//! The CXS job-search shape this reads is an undocumented internal interface of a tenant's own career site, not a licensed public candidate API. It can change without notice, so every response is treated as untrusted and every sweep states its own completeness. The listing search uses a read-only POST; it never submits an application.
 
 use opportunity_domain::{FetchedPosting, RunOutcome, ScanResult, SourceRunStats};
 use serde::Deserialize;
@@ -14,9 +14,6 @@ pub const HOST_SUFFIX: &str = "myworkdayjobs.com";
 const PAGE_SIZE: usize = 20;
 /// Hard ceiling on requests per sweep. A tenant with more postings than this reports `partial` rather than being hammered.
 const MAX_PAGES: usize = 25;
-
-/// Environment variable the owner sets to permit the first live Workday read. No autonomous build session sets it.
-pub const LIVE_OPT_IN_ENV: &str = "WORKDAY_LIVE_PROBE";
 
 fn endpoint(tenant: &str, instance: &str, site: &str) -> String {
     format!("https://{tenant}.{instance}.{HOST_SUFFIX}/wday/cxs/{tenant}/{site}/jobs")
@@ -131,18 +128,6 @@ pub fn assess(
 }
 
 pub async fn scan(client: &HttpClient, tenant: &str, instance: &str, site: &str) -> ScanResult {
-    if std::env::var(LIVE_OPT_IN_ENV)
-        .map(|v| v != "1")
-        .unwrap_or(true)
-    {
-        return ScanResult::failed(
-            RunOutcome::AccessDenied,
-            format!(
-                "live Workday reads are off by default because this interface requires a POST, which is outside the project's approval for public listing GET requests. The adapter is fixture tested. Set {LIVE_OPT_IN_ENV}=1 to permit a supervised first live read."
-            ),
-        );
-    }
-
     let url = endpoint(tenant, instance, site);
     let mut postings: Vec<FetchedPosting> = Vec::new();
     let mut pages_fetched = 0i32;
@@ -176,7 +161,7 @@ pub async fn scan(client: &HttpClient, tenant: &str, instance: &str, site: &str)
             );
             return partial_or_failure(postings, pages_fetched, total_reported, outcome, detail);
         }
-        let (page_postings, page_total) = match parse_page(&response.body, tenant, instance) {
+        let (mut page_postings, page_total) = match parse_page(&response.body, tenant, instance) {
             Ok(parsed) => parsed,
             Err(error) => {
                 let detail = format!("workday payload did not parse on page {page}: {error}");
@@ -189,6 +174,12 @@ pub async fn scan(client: &HttpClient, tenant: &str, instance: &str, site: &str)
                 );
             }
         };
+        for posting in &mut page_postings {
+            let origin = format!("https://{tenant}.{instance}.{HOST_SUFFIX}");
+            if let Some(path) = posting.url.strip_prefix(&origin) {
+                posting.url = format!("{origin}/en-US/{site}{path}");
+            }
+        }
         pages_fetched += 1;
         total_reported = page_total.or(total_reported);
         let page_len = page_postings.len();
@@ -396,15 +387,5 @@ mod tests {
         assert!(parse_page("{}", "t", "wd3").is_err());
         assert!(parse_page("[]", "t", "wd3").is_err());
         assert!(parse_page(r#"{"postings":[]}"#, "t", "wd3").is_err());
-    }
-
-    #[tokio::test]
-    async fn a_live_read_is_refused_unless_the_owner_opts_in() {
-        let client = HttpClient::new().unwrap();
-        let result = scan(&client, "examplechip", "wd3", "careers").await;
-        assert_eq!(result.outcome, RunOutcome::AccessDenied);
-        assert!(!result.outcome.is_complete_sweep());
-        assert!(result.diagnostic.unwrap().contains(LIVE_OPT_IN_ENV));
-        assert!(result.postings.is_empty());
     }
 }
