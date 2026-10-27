@@ -35,3 +35,11 @@ it("requires a deliberate employer authorization and displays exact questions",a
  await waitFor(()=>expect(fetch.mock.calls.some(c=>c[0]==='/api/home/answer/q1')).toBe(true));
  expect(fetch.mock.calls.some(c=>c[0]==='/api/home/authorize')).toBe(false);
 });
+it("labels the blended priority honestly and flags postings that need review",async()=>{
+ const job={id:'j2',canonical_title:'PhD position, memory systems',organization:'Example Lab',provider:'academic',source_key:'lab',apply_url:'https://example.test',last_seen_at:'2026-10-25T08:00:00Z',score:81.4,technical:70.2,profile_match:40,career_stage:'PhD position',career_priority:60,eligibility:'needs_review',explanation:'PhD position · Your CV: DRAM',gaps:['No funded vacancy confirmed']};
+ vi.stubGlobal('fetch',vi.fn(async(path:string)=>Response.json(path.endsWith('/home')?{...home,jobs:[job],matches:1}:{})));render(<App/>);
+ expect(await screen.findByText('Needs review')).toBeDefined();
+ expect(screen.getByText('Priority 81 · technical fit 70 · career stage 60 · profile 40')).toBeDefined();
+ expect(screen.getByText('No funded vacancy confirmed')).toBeDefined();
+ expect(screen.queryByText('Strong fit')).toBeNull();
+});

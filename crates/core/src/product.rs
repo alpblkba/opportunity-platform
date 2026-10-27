@@ -64,11 +64,21 @@ pub async fn select(db: &Db, id: Uuid) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Names the ranking rules in API output, so a score can be traced to the policy that produced it.
+pub const RANKING_POLICY: &str = "career-priority-v2";
+
 #[derive(Debug, Serialize)]
 pub struct RankedJob {
     #[serde(flatten)]
     pub job: matching::ScoredRow,
+    /// Priority for this owner, blending the three components below. Not a hiring probability.
     pub score: f32,
+    pub technical: f32,
+    pub profile_match: f32,
+    pub career_stage: &'static str,
+    pub career_priority: f32,
+    /// "eligible", or "needs_review" when a gap below cannot be settled from the CV and posting.
+    pub eligibility: &'static str,
     pub explanation: String,
     pub gaps: Vec<String>,
     pub auto_eligible: bool,
@@ -76,9 +86,185 @@ pub struct RankedJob {
     pub provider: String,
 }
 
-fn direction(key: &str) -> &'static [&'static str] {
+/// Classified from the posting kind and title only: descriptions often mention supervising
+/// interns or a past internship without being internships themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CareerStage {
+    Thesis,
+    Internship,
+    WorkingStudent,
+    ResearchAssistant,
+    Phd,
+    NewGrad,
+    Junior,
+    Unspecified,
+    Mid,
+    Senior,
+    Staff,
+}
+
+impl CareerStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Thesis => "Master's thesis",
+            Self::Internship => "Internship",
+            Self::WorkingStudent => "Working student",
+            Self::ResearchAssistant => "Research assistant",
+            Self::Phd => "PhD position",
+            Self::NewGrad => "New graduate",
+            Self::Junior => "Junior",
+            Self::Unspecified => "Level not stated",
+            Self::Mid => "Mid-level",
+            Self::Senior => "Senior",
+            Self::Staff => "Staff / principal",
+        }
+    }
+}
+
+/// Initial, uncalibrated policy: (technical, saved profile, career stage) weights.
+fn weights(profile_key: &str) -> (f32, f32, f32) {
+    if profile_key == "research" {
+        (0.45, 0.20, 0.35)
+    } else {
+        (0.55, 0.15, 0.30)
+    }
+}
+
+/// 0-100 preference for a stage. Research has its own table so a funded PhD vacancy is not
+/// outranked by an internship's stage bonus, while an unconfirmed PhD is never treated as funded.
+fn stage_priority(stage: CareerStage, profile_key: &str, advertised_state: &str) -> f32 {
+    use CareerStage::*;
+    let research = profile_key == "research";
+    match stage {
+        Thesis => 100.0,
+        Internship if research => 85.0,
+        Internship => 100.0,
+        WorkingStudent if research => 80.0,
+        WorkingStudent | ResearchAssistant => 92.0,
+        Phd if research && advertised_state == "advertised" => 95.0,
+        Phd if research => 60.0,
+        Phd => 65.0,
+        NewGrad if research => 72.0,
+        NewGrad => 78.0,
+        Junior if research => 68.0,
+        Junior => 74.0,
+        Unspecified => 52.0,
+        Mid => 36.0,
+        Senior => 8.0,
+        Staff => 2.0,
+    }
+}
+
+/// Recover an explicit title category only for generic feed classifications.
+fn effective_kind(job: &matching::ScoredRow) -> &str {
+    use opportunity_domain::OpportunityKind as K;
+    if matches!(job.kind.as_str(), "employment" | "other" | "part_time") {
+        match opportunity_domain::classify_kind(&job.canonical_title, None) {
+            K::MasterThesis => return "master_thesis",
+            K::Internship => return "internship",
+            K::WorkingStudent => return "working_student",
+            K::ResearchAssistant => return "research_assistant",
+            K::Phd => return "phd",
+            _ => {}
+        }
+    }
+    &job.kind
+}
+
+fn career_stage(job: &matching::ScoredRow) -> CareerStage {
+    use CareerStage::*;
+    match effective_kind(job) {
+        "master_thesis" => return Thesis,
+        "internship" => return Internship,
+        "working_student" => return WorkingStudent,
+        "research_assistant" => return ResearchAssistant,
+        "phd" => return Phd,
+        _ => {}
+    }
+    let title = opportunity_domain::normalize_location(Some(&job.canonical_title));
+    let has = |words: &[&str]| {
+        words
+            .iter()
+            .any(|w| opportunity_domain::normalize::contains_phrase(&title, w))
+    };
+    // German academic employment ("wissenschaftliche/r Mitarbeiter/in") is in practice a doctoral post.
+    if title.contains("wissenschaftlich") && title.contains("mitarbeiter") {
+        return Phd;
+    }
+    if has(&[
+        "staff",
+        "principal",
+        "distinguished",
+        "director",
+        "head of",
+        "vp",
+    ]) {
+        return Staff;
+    }
+    if has(&["senior", "sr", "lead", "manager", "iii", "l5", "l6"]) {
+        return Senior;
+    }
+    if has(&[
+        "mid",
+        "mid level",
+        "midlevel",
+        "mid career",
+        "intermediate",
+        "ii",
+        "l4",
+    ]) {
+        return Mid;
+    }
+    if has(&["student"]) {
+        return WorkingStudent;
+    }
+    if has(&[
+        "new grad",
+        "new graduate",
+        "new college graduate",
+        "graduate",
+        "early career",
+        "early talent",
+        "entry level",
+        "entrylevel",
+        "absolvent",
+        "berufseinsteiger",
+        "trainee",
+    ]) {
+        return NewGrad;
+    }
+    if has(&["junior", "jr", "associate engineer", "engineer i", "l3"]) {
+        return Junior;
+    }
+    // A plain "Software Engineer" is not assumed junior; a stated requirement only downranks.
+    match required_years(job.description_text.as_deref().unwrap_or("")) {
+        Some(years) if years >= 8 => Senior,
+        Some(years) if years >= 5 => Mid,
+        _ => Unspecified,
+    }
+}
+
+fn priority_score(technical: f32, profile: f32, stage: f32, profile_key: &str) -> f32 {
+    let (t, p, s) = weights(profile_key);
+    (t * technical.clamp(0.0, 100.0) + p * profile.clamp(0.0, 100.0) + s * stage).clamp(0.0, 100.0)
+}
+
+/// Neither stage priority nor a profile score grants permission to submit; the per-employer
+/// authorization is still checked separately before any submission.
+fn auto_application_eligible(
+    cv_auto_eligible: bool,
+    profile_fit: &opportunity_domain::MatchResult,
+    advertised_state: &str,
+) -> bool {
+    cv_auto_eligible
+        && profile_fit.eligible
+        && profile_fit.score >= 20.0
+        && advertised_state == "advertised"
+}
+
+fn direction(key: &str) -> Vec<&'static str> {
     match key {
-        "firmware" => &[
+        "firmware" => vec![
             "firmware",
             "embedded",
             "RTOS",
@@ -86,7 +272,7 @@ fn direction(key: &str) -> &'static [&'static str] {
             "device driver",
             "platform systems",
         ],
-        "memory" => &[
+        "memory" => vec![
             "memory",
             "DRAM",
             "CXL",
@@ -96,7 +282,7 @@ fn direction(key: &str) -> &'static [&'static str] {
             "Linux",
             "storage",
         ],
-        "architecture" => &[
+        "architecture" => vec![
             "CPU",
             "RTL",
             "microarchitecture",
@@ -106,7 +292,7 @@ fn direction(key: &str) -> &'static [&'static str] {
             "ASIC",
             "architecture",
         ],
-        "ai-systems" => &[
+        "ai-systems" => vec![
             "AI",
             "GPU",
             "accelerator",
@@ -116,14 +302,12 @@ fn direction(key: &str) -> &'static [&'static str] {
             "co-design",
             "inference",
         ],
-        _ => &[
-            "research",
-            "thesis",
-            "doctoral",
-            "PhD",
-            "Masterarbeit",
-            "internship",
-        ],
+        // Research positions in the same four technical areas. Stage words such as "internship"
+        // gave any internship technical credit; thesis/PhD kinds come from the profile's job kinds.
+        _ => ["firmware", "memory", "architecture", "ai-systems"]
+            .into_iter()
+            .flat_map(direction)
+            .collect(),
     }
 }
 
@@ -143,11 +327,12 @@ fn fit(
             &opportunity_domain::normalize_location(Some(term)),
         )
     };
-    let title_matches = direction(key)
+    let terms = direction(key);
+    let title_matches = terms
         .iter()
         .filter(|w| contains(&normalized_title, w))
         .count();
-    let body_matches = direction(key)
+    let body_matches = terms
         .iter()
         .filter(|w| contains(&normalized_description, w))
         .count();
@@ -273,24 +458,73 @@ pub async fn ranked(db: &Db, profile_id: Uuid) -> Result<Vec<RankedJob>, AppErro
         return Ok(vec![]);
     };
     let profile = profiles::get(db, profile_id).await?;
-    let rows = matching::shortlist(db, &matching::MatchQuery::default()).await?;
+    let key = profile.profile.key.as_str();
+    let rules = profiles::rules_for(db, Some(profile_id)).await?;
+    // Load only rows that contain a direction term, which fit() requires anyway, so the shortlist
+    // cap can no longer drop an older relevant posting behind newer irrelevant ones.
+    let terms = direction(key)
+        .iter()
+        .map(|t| {
+            if t.contains(' ') {
+                format!("\"{t}\"")
+            } else {
+                (*t).to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let query = matching::MatchQuery {
+        q: Some(terms),
+        ..Default::default()
+    };
+    let rows = matching::shortlist(db, &query).await?;
     let sources: Vec<(Uuid,String,String)>=sqlx::query_as("select distinct on(p.opportunity_id) p.opportunity_id,s.key,s.kind from postings p join sources s on s.id=p.source_id where p.closed_at is null and p.opportunity_id is not null order by p.opportunity_id,p.url")
         .fetch_all(db).await?;
     let mut ranked = Vec::new();
     for row in rows {
-        let (score, explanation, gaps, auto_eligible) = fit(&cv, &profile.profile.key, &row);
-        if score < 20.0 {
+        let (technical, evidence, mut gaps, cv_auto_eligible) = fit(&cv, key, &row);
+        // No stage bonus can rescue an unrelated technical match.
+        if technical < 20.0 {
+            continue;
+        }
+        let applicable: Vec<_> = rules
+            .iter()
+            .filter(|(_, target)| target.is_none() || *target == Some(row.id))
+            .map(|(rule, _)| rule.clone())
+            .collect();
+        let mut candidate = matching::to_candidate(&row);
+        candidate.kind = effective_kind(&row).to_owned();
+        let profile_fit =
+            opportunity_domain::evaluate(&profile.profile, &candidate, &applicable, None);
+        // Saved kinds, location preferences and blacklist rules are hard exclusions.
+        if !profile_fit.eligible {
             continue;
         }
         let Some((_, source_key, provider)) = sources.iter().find(|s| s.0 == row.id) else {
             continue;
         };
+        let stage = career_stage(&row);
+        if stage == CareerStage::Phd && row.advertised_state != "advertised" {
+            gaps.push("No funded vacancy confirmed".into());
+        }
+        let career_priority = stage_priority(stage, key, &row.advertised_state);
+        let auto_eligible =
+            auto_application_eligible(cv_auto_eligible, &profile_fit, &row.advertised_state);
         ranked.push(RankedJob {
-            job: row,
-            score,
-            explanation,
+            score: priority_score(technical, profile_fit.score, career_priority, key),
+            technical,
+            profile_match: profile_fit.score,
+            career_stage: stage.label(),
+            career_priority,
+            eligibility: if gaps.is_empty() {
+                "eligible"
+            } else {
+                "needs_review"
+            },
+            explanation: format!("{} · {evidence}", stage.label()),
             gaps,
             auto_eligible,
+            job: row,
             source_key: source_key.clone(),
             provider: provider.clone(),
         });
@@ -343,7 +577,7 @@ pub async fn dashboard(db: &Db) -> Result<Value, AppError> {
     let questions = applications::list_review_tasks(db, None).await?;
     let mail:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('application_id',application_id,'state',delivery_state,'error',delivery_error) from notifications where kind='submitted' order by created_at desc limit 100").fetch_all(db).await?;
     Ok(
-        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some()}),
+        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some(),"ranking_policy":RANKING_POLICY}),
     )
 }
 
@@ -531,5 +765,231 @@ mod tests {
     fn requirements_are_not_cv_qualifications() {
         assert_eq!(required_years("Requires 7+ years of experience"), Some(7));
         assert_eq!(required_years("Our company was founded in 2001"), None);
+    }
+
+    use opportunity_domain::{ExclusionKind, ExclusionRule, Profile};
+
+    fn row(title: &str, kind: &str, description: &str) -> matching::ScoredRow {
+        matching::ScoredRow {
+            id: Uuid::new_v4(),
+            canonical_title: title.to_owned(),
+            organization: "Example Silicon".into(),
+            kind: kind.into(),
+            advertised_state: "advertised".into(),
+            country_code: Some("DE".into()),
+            city: Some("Munich".into()),
+            remote_raw: None,
+            deadline_at: None,
+            supervisor: None,
+            first_seen_at: Utc::now(),
+            last_seen_at: Utc::now(),
+            title_only: description.is_empty(),
+            apply_url: None,
+            description_text: Some(description.to_owned()),
+            department: None,
+            source_names: vec!["Example Silicon".into()],
+        }
+    }
+
+    fn assess(profile: &Profile, job: &matching::ScoredRow, rules: &[ExclusionRule]) -> bool {
+        let mut candidate = matching::to_candidate(job);
+        candidate.kind = effective_kind(job).to_owned();
+        opportunity_domain::evaluate(profile, &candidate, rules, None).eligible
+    }
+
+    #[test]
+    fn titles_classify_into_career_stages() {
+        use CareerStage::*;
+        for (title, kind, expected) in [
+            ("Masterarbeit: RISC-V", "master_thesis", Thesis),
+            ("Masterarbeit: DRAM", "employment", Thesis),
+            ("Firmware Internship", "employment", Internship),
+            ("Firmware Werkstudent (m/w/d)", "employment", WorkingStudent),
+            (
+                "Student Researcher, Memory Systems",
+                "employment",
+                WorkingStudent,
+            ),
+            ("PhD Candidate in Memory Systems", "employment", Phd),
+            (
+                "Doctoral Researcher, Computer Architecture",
+                "employment",
+                Phd,
+            ),
+            (
+                "Wissenschaftliche/r Mitarbeiter/in Rechnerarchitektur",
+                "employment",
+                Phd,
+            ),
+            (
+                "New College Graduate, GPU Architecture",
+                "employment",
+                NewGrad,
+            ),
+            ("Early Talent Firmware Engineer", "employment", NewGrad),
+            ("Junior Firmware Engineer", "employment", Junior),
+            ("Firmware Engineer I", "employment", Junior),
+            ("Associate Engineer, RTL", "employment", Junior),
+            ("Firmware Engineer", "employment", Unspecified),
+            ("Research Engineer, Accelerators", "employment", Unspecified),
+            ("Firmware Engineer II", "employment", Mid),
+            ("Mid-Level Firmware Engineer", "employment", Mid),
+            ("Senior Firmware Engineer", "employment", Senior),
+            ("Sr. RTL Design Engineer", "employment", Senior),
+            ("Principal CPU Architect", "employment", Staff),
+            ("Staff Engineer, Memory", "employment", Staff),
+        ] {
+            assert_eq!(career_stage(&row(title, kind, "")), expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn body_text_never_changes_the_stage_except_to_downrank() {
+        use CareerStage::*;
+        let stage = |title, body| career_stage(&row(title, "employment", body));
+        assert_eq!(
+            stage("Software Engineer", "You will mentor interns."),
+            Unspecified
+        );
+        assert_eq!(stage("International Firmware Engineer", ""), Unspecified);
+        assert_eq!(
+            stage("Firmware Engineer", "Requires 6+ years of experience"),
+            Mid
+        );
+        assert_eq!(
+            stage("Firmware Engineer", "Requires 9+ years of experience"),
+            Senior
+        );
+    }
+
+    #[test]
+    fn equal_relevance_orders_thesis_and_internship_then_student_junior_mid_senior() {
+        use CareerStage::*;
+        let score = |stage| {
+            priority_score(
+                75.0,
+                60.0,
+                stage_priority(stage, "memory", "advertised"),
+                "memory",
+            )
+        };
+        let order = [
+            Thesis,
+            WorkingStudent,
+            NewGrad,
+            Junior,
+            Unspecified,
+            Mid,
+            Senior,
+            Staff,
+        ];
+        assert_eq!(score(Thesis), score(Internship));
+        for pair in order.windows(2) {
+            assert!(
+                score(pair[0]) > score(pair[1]),
+                "{:?} > {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Strong technical fit beats a weak internship; the score stays bounded.
+        assert!(
+            priority_score(
+                95.0,
+                75.0,
+                stage_priority(Junior, "firmware", "advertised"),
+                "firmware"
+            ) > priority_score(
+                35.0,
+                40.0,
+                stage_priority(Internship, "firmware", "advertised"),
+                "firmware"
+            )
+        );
+        assert!(priority_score(150.0, 150.0, 100.0, "firmware") <= 100.0);
+    }
+
+    #[test]
+    fn research_keeps_a_funded_phd_ahead_of_an_internship_but_not_an_unfunded_one() {
+        use CareerStage::*;
+        let research = |stage, state| {
+            priority_score(
+                70.0,
+                60.0,
+                stage_priority(stage, "research", state),
+                "research",
+            )
+        };
+        assert!(research(Phd, "advertised") > research(Internship, "advertised"));
+        assert!(research(Phd, "open_topic") < research(Internship, "advertised"));
+        assert!(research(Thesis, "open_topic") >= research(Phd, "advertised"));
+        // Outside research the engineering table applies.
+        assert!(
+            stage_priority(Internship, "firmware", "advertised")
+                > stage_priority(Phd, "firmware", "advertised")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_internship_gets_no_technical_credit_in_any_profile() {
+        let cv = CandidateProfile {
+            skills: vec!["Linux".into(), "DRAM".into()],
+            ..Default::default()
+        };
+        let marketing = row(
+            "Marketing Internship",
+            "internship",
+            "Social media and brand strategy",
+        );
+        for (key, _) in TRACKS {
+            assert_eq!(fit(&cv, key, &marketing).0, 0.0, "{key}");
+        }
+        let thesis = row(
+            "Masterarbeit: DRAM reliability",
+            "master_thesis",
+            "DRAM memory Linux",
+        );
+        assert!(fit(&cv, "research", &thesis).0 >= 20.0);
+    }
+
+    #[test]
+    fn saved_location_kind_and_blacklist_exclude_before_ranking() {
+        let mut profile = Profile::blank("memory", "Memory systems");
+        profile.terms = vec!["DRAM".into()];
+        profile.preferred_countries = vec!["DE".into()];
+        profile.job_kinds = vec!["internship".into(), "master_thesis".into()];
+        let mut job = row("DRAM Internship", "internship", "DRAM memory systems");
+        assert!(assess(&profile, &job, &[]));
+        job.country_code = Some("FR".into());
+        assert!(!assess(&profile, &job, &[]));
+        job.country_code = Some("DE".into());
+        job.kind = "employment".into();
+        job.canonical_title = "DRAM Engineer".into();
+        assert!(!assess(&profile, &job, &[]));
+        job.kind = "internship".into();
+        let rule = ExclusionRule {
+            kind: ExclusionKind::Company,
+            value: "Example Silicon".into(),
+            note: None,
+        };
+        assert!(!assess(&profile, &job, &[rule]));
+    }
+
+    #[test]
+    fn stage_priority_never_authorizes_an_automatic_application() {
+        let mut profile = Profile::blank("memory", "Memory systems");
+        profile.terms = vec!["DRAM".into()];
+        let job = row("DRAM Internship", "internship", "DRAM memory systems");
+        let mut candidate = matching::to_candidate(&job);
+        candidate.kind = effective_kind(&job).to_owned();
+        let fit = opportunity_domain::evaluate(&profile, &candidate, &[], None);
+        assert!(fit.eligible);
+        assert!(!auto_application_eligible(false, &fit, "advertised"));
+        assert!(!auto_application_eligible(true, &fit, "open_topic"));
+        assert!(!auto_application_eligible(
+            true,
+            &fit,
+            "potential_supervisor"
+        ));
     }
 }

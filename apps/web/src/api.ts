@@ -26,7 +26,7 @@ export const api = {
 };
 export interface Application { id: string; opportunity_id: string; status: string; reason?: string; title: string; employer: string; url: string }
 export interface Question { id: string; application_id: string; question_text: string; field_type: string; options: string[] }
-export interface Job { id: string; canonical_title: string; organization: string; city?: string; country_code?: string; remote_raw?: string; apply_url: string; last_seen_at: string; score: number; explanation: string; gaps: string[]; source_key: string; provider: string }
+export interface Job { id: string; canonical_title: string; organization: string; city?: string; country_code?: string; remote_raw?: string; apply_url: string; last_seen_at: string; score: number; technical: number; profile_match: number; career_stage: string; career_priority: number; eligibility: "eligible" | "needs_review"; explanation: string; gaps: string[]; source_key: string; provider: string }
 export interface Home {
   cv: { id: string; label: string; created_at: string } | null;
   cv_ready: boolean;

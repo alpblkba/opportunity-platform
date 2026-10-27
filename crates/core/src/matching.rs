@@ -107,7 +107,7 @@ pub(crate) async fn shortlist(
     .await
 }
 
-fn to_candidate(row: &ScoredRow) -> Candidate {
+pub(crate) fn to_candidate(row: &ScoredRow) -> Candidate {
     Candidate {
         title: row.canonical_title.clone(),
         organization: row.organization.clone(),
