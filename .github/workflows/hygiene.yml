@@ -102,6 +102,60 @@ jobs:
             "select count(*) from pg_database where datname ~ '^opportunity_(auth|app|test)_[0-9a-f]{32}$'")"
           [[ "$remaining" == 0 ]] || { echo "Integration tests left temporary databases behind" >&2; exit 1; }
 
+  acceptance:
+    name: Product acceptance journey
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: opportunity_ci
+          POSTGRES_PASSWORD: synthetic_ci_only
+          POSTGRES_DB: opportunity_ci
+        options: >-
+          --health-cmd "pg_isready -U opportunity_ci -d opportunity_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+          save-if: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            apps/web/package-lock.json
+            apps/browser-worker/package-lock.json
+      - name: Build server, interface and browser worker
+        run: |
+          cargo build --locked --bin opportunity
+          npm ci --prefix apps/web && npm --prefix apps/web run build
+          npm ci --prefix apps/browser-worker && npm --prefix apps/browser-worker run build
+      - name: Install Chromium and its OS dependencies
+        run: npx --no-install playwright install --with-deps --only-shell chromium
+        working-directory: apps/browser-worker
+      # Synthetic CV, ranking corpus, mock ATS and mail fixture on loopback; every seed source disabled.
+      - name: Landing, login, CV, ranking, questions, mock submission, email, restart
+        env:
+          TEST_OFFLINE: '1'
+          TEST_DB_CONTAINER: ${{ job.services.postgres.id }}
+          TEST_DB_USER: opportunity_ci
+          TEST_DB_PASSWORD: synthetic_ci_only
+          TEST_OUTPUT_DIR: ${{ runner.temp }}/product-test
+        run: node scripts/test-product.mjs
+      # Real pg_dump, gpg and pg_restore against disposable containers and a throwaway key.
+      - name: Encrypted backup, restore rehearsal and refusal of damaged backups
+        run: python3 -I scripts/test-backup-roundtrip.py
+
   frontend:
     name: Frontend validation
     runs-on: ubuntu-24.04

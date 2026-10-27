@@ -954,8 +954,9 @@ async fn cv_upload_download_and_versions_work_with_native_and_cloudflare_identit
                 assertion("owner@example.test", chrono::Duration::hours(1)),
             )
         };
-        let url = format!("{}/api/documents/cv?filename=synthetic-cv.pdf", server.base);
-        let bytes = b"%PDF-1.4\nSynthetic CV fixture, no personal data.\n%%EOF";
+        // Uploads must be readable CVs; real PDF extraction is covered by scripts/test-cv-pdf.mjs.
+        let url = format!("{}/api/documents/cv?filename=synthetic-cv.txt", server.base);
+        let bytes = b"Ada Example\nSkills\nSynthetic CV fixture with Linux, Rust and DRAM, no personal data.\n";
         assert_eq!(
             server
                 .client
@@ -1020,7 +1021,7 @@ async fn cv_upload_download_and_versions_work_with_native_and_cloudflare_identit
             assert!(response.headers()["content-disposition"]
                 .to_str()
                 .unwrap()
-                .contains(".pdf"));
+                .contains(".txt"));
             assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
             let path: String = sqlx::query_scalar("select file_path from documents where id=$1")
                 .bind(Uuid::parse_str(&id).unwrap())

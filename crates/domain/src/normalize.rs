@@ -105,7 +105,7 @@ pub fn normalize_location(location: Option<&str>) -> String {
 /// Whole-phrase containment on an already folded, space-separated string. Substring matching would let `intern` fire on `international`, so both ends of a hit must sit on a word boundary.
 ///
 /// Scanning rather than splitting matters here: matching runs this tens of times against every opportunity's whole description, and building a word vector per call was most of the cost of ranking the corpus.
-pub(crate) fn contains_phrase(haystack: &str, phrase: &str) -> bool {
+pub fn contains_phrase(haystack: &str, phrase: &str) -> bool {
     if phrase.is_empty() || phrase.len() > haystack.len() {
         return false;
     }

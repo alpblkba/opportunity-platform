@@ -34,6 +34,7 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
+        .route("/ops/status", get(ops_status))
         .route("/stats", get(stats))
         .route("/coverage", get(coverage))
         .route("/opportunities", get(list_opportunities))
@@ -46,7 +47,8 @@ pub fn router(state: AppState) -> Router {
         .route("/refresh", post(refresh_all))
         .merge(crate::personalization::router())
         .merge(crate::applications::router())
-        .merge(crate::documents::router());
+        .merge(crate::documents::router())
+        .merge(crate::product::router());
 
     // Everything under /api touches personal data, so the identity check wraps all of it in one place rather than route by route, where one forgotten route would be a leak.
     let api = api.route_layer(axum::middleware::from_fn_with_state(
@@ -116,6 +118,11 @@ async fn ready(State(state): State<AppState>) -> Result<Json<Health>, ApiError> 
         status: "ready",
         version: env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// Behind the same identity check as every other `/api` route: it names failing employers and counts.
+async fn ops_status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(opportunity_core::ops::status(&state.db).await?))
 }
 
 async fn stats(State(state): State<AppState>) -> Result<Json<query::Stats>, ApiError> {

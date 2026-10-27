@@ -123,3 +123,86 @@ enabled = true
 refresh_hours = 24
 tags = ["academic", "germany", "potsdam", "research"]
 notes = "shared career site: rows for affiliated Plattner Foundation entities also appear"
+
+# Public listing endpoint verified during local product development.
+[[sources]]
+key = "nvidia-workday"
+kind = "workday"
+organization = "NVIDIA"
+tenant = "nvidia"
+instance = "wd5"
+site = "NVIDIAExternalCareerSite"
+enabled = true
+refresh_hours = 12
+tags = ["gpu", "systems", "silicon"]
+
+# Added 2026-10-27. Each identifier answered a read-only request with HTTP 200 and a non-empty result
+# (Greenhouse/Ashby job arrays; Workday CXS search total). Intel, Micron and Cadence exceed the
+# adapter's 500-posting sweep ceiling, so their sweeps report `partial`; Marvell (343) sweeps ok_complete.
+# Not added because the endpoint did not verify: AMD, Qualcomm, Arm, Ampere, Synopsys (Workday 422),
+# Groq, SiFive, Rivos, d-Matrix, Ayar Labs, Enfabrica, Celestial AI (no Greenhouse/Ashby board).
+# Anthropic's Greenhouse listing with descriptions exceeds the HTTP client's 8 MiB cap (sized for the
+# e2-micro), so its sweep falls back to Greenhouse's titles-only form: 679 postings, ok_complete,
+# all title-only and therefore for review (2026-10-27). OpenAI (Ashby) also exceeds the cap and
+# Ashby's posting API has no smaller form, so it is not added.
+[[sources]]
+key = "anthropic-greenhouse"
+kind = "greenhouse"
+organization = "Anthropic"
+board_token = "anthropic"
+enabled = true
+refresh_hours = 12
+tags = ["ai-systems"]
+
+[[sources]]
+key = "extropic-ashby"
+kind = "ashby"
+organization = "Extropic"
+board_slug = "extropic"
+enabled = true
+refresh_hours = 6
+tags = ["silicon", "ai-accelerator"]
+
+[[sources]]
+key = "intel-workday"
+kind = "workday"
+organization = "Intel"
+tenant = "intel"
+instance = "wd1"
+site = "External"
+enabled = true
+refresh_hours = 12
+tags = ["cpu", "silicon", "systems"]
+
+[[sources]]
+key = "micron-workday"
+kind = "workday"
+organization = "Micron"
+tenant = "micron"
+instance = "wd1"
+site = "External"
+enabled = true
+refresh_hours = 12
+tags = ["memory", "silicon"]
+
+[[sources]]
+key = "marvell-workday"
+kind = "workday"
+organization = "Marvell"
+tenant = "marvell"
+instance = "wd1"
+site = "MarvellCareers"
+enabled = true
+refresh_hours = 12
+tags = ["silicon", "systems"]
+
+[[sources]]
+key = "cadence-workday"
+kind = "workday"
+organization = "Cadence Design Systems"
+tenant = "cadence"
+instance = "wd1"
+site = "External_Careers"
+enabled = true
+refresh_hours = 12
+tags = ["silicon", "verification"]

@@ -1,0 +1,84 @@
+name: deploy
+
+# Ships a master commit only after "continuous integration" passed on that exact commit. The
+# existing scripts do the work: release-image.sh builds the reviewed archive, deploy-vm.sh copies it
+# over IAP and runs vm-release.sh (journal lock, retained previous image, health checks, rollback;
+# no database backup, which is why schema changes never deploy from here). Secrets stay in
+# .env.prod on the VM. Inert until the owner completes docs/DEPLOYMENT.md "Automated deployment"
+# and sets the DEPLOY_ENABLED repository variable.
+on:
+  workflow_run:
+    workflows: [continuous integration]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+# One release at a time; a newer pending run replaces an older pending one.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Build, deploy and verify
+    if: >-
+      vars.DEPLOY_ENABLED == 'true' && (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+        (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    env:
+      REVIEWED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+      GCP_INSTANCE: ${{ vars.GCP_INSTANCE }}
+      GCP_ZONE: ${{ vars.GCP_ZONE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.REVIEWED_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the candidate to be on master and green in CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git merge-base --is-ancestor "$REVIEWED_SHA" origin/master || { echo "::error::${REVIEWED_SHA} is not on master"; exit 1; }
+          green="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/hygiene.yml/runs?head_sha=${REVIEWED_SHA}&event=push&status=success" --jq '.total_count')"
+          [[ "$green" -ge 1 ]] || { echo "::error::continuous integration has not passed on ${REVIEWED_SHA}"; exit 1; }
+      # Short-lived credentials through Workload Identity Federation; no service-account key exists.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      # Compares with what the VM reports it runs (image revision label, SQLx migration checksums),
+      # not with Actions history. A release that adds migrations is always refused here, manual runs
+      # included: it needs a verified backup only the owner's machine holds (docs/DEPLOYMENT.md).
+      - name: Release gate against production's actual state (changes nothing)
+        id: gate
+        run: |
+          rc=0; ./scripts/deploy-vm.sh --gate || rc=$?
+          if [[ "$rc" == 10 ]]; then echo "skip=true" >> "$GITHUB_OUTPUT"; elif [[ "$rc" != 0 ]]; then exit 1; fi
+      - name: Build the reviewed linux/amd64 image archive
+        if: steps.gate.outputs.skip != 'true'
+        run: ./scripts/release-image.sh
+      - name: Preflight against the VM (changes nothing)
+        if: steps.gate.outputs.skip != 'true'
+        run: ./scripts/deploy-vm.sh --preflight "dist/opportunity-app-${REVIEWED_SHA}-amd64.tar.gz"
+      - name: Deploy with recovery point, health checks and rollback
+        if: steps.gate.outputs.skip != 'true'
+        run: ./scripts/deploy-vm.sh "dist/opportunity-app-${REVIEWED_SHA}-amd64.tar.gz"
+      - name: Report the running release
+        if: always()
+        run: ./scripts/deploy-vm.sh --status

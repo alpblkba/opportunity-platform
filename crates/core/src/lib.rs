@@ -2,13 +2,17 @@
 
 pub mod applications;
 pub mod auth;
+pub mod candidate;
 pub mod config;
 pub mod db;
 pub mod digest;
 pub mod documents;
 pub mod embeddings;
 pub mod ingest;
+pub mod mail;
 pub mod matching;
+pub mod ops;
+pub mod product;
 pub mod profiles;
 pub mod query;
 pub mod scheduler;

@@ -79,3 +79,5 @@ __pycache__/
 /docs/PRE_COMMIT_REVIEW.md
 /docs/GCP_DEPLOYMENT.md
 /docs/E2_MICRO_AUDIT.md
+# Generated review artefacts: diff snapshots duplicate commits kept in the history and the backup bundle.
+/docs/implementation/review/*.patch

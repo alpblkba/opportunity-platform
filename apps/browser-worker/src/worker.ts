@@ -7,11 +7,11 @@
  */
 import { chromium, type Browser, type Page } from "playwright";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
-import { assertNavigable } from "./guard.js";
+import { assertSupported, openForm, receiptOn } from "./providers.js";
 
 export type FieldKind =
   | "text" | "email" | "phone" | "url" | "select" | "checkbox" | "radio" | "textarea" | "file" | "unsupported";
@@ -70,33 +70,42 @@ async function readFields(page: Page): Promise<FormField[]> {
         if (parent.hidden) return false;
         parent = parent.parentElement;
       }
-      return true;
+      return getComputedStyle(node).display !== "none" && getComputedStyle(node).visibility !== "hidden";
     };
     const labelFor = (el: Element): string => {
+      const groupLabel = el.closest("[data-field-path]")?.querySelector("label");
+      if (groupLabel?.textContent) return groupLabel.textContent.trim();
       const id = el.getAttribute("id");
       if (id) {
-        const explicit = document.querySelector(`label[for="${id}"]`);
+        const explicit = document.querySelector(`label[for="${CSS.escape(id)}"]`);
         if (explicit?.textContent) return explicit.textContent.trim();
+      }
+      if (el.getAttribute("type") === "radio") {
+        const group = el.closest("fieldset, .application-question, [role=radiogroup]");
+        const heading = group?.querySelector("legend, .application-label, [data-qa=question-label]");
+        if (heading?.textContent) return heading.textContent.trim();
       }
       const wrapping = el.closest("label");
       if (wrapping?.textContent) return wrapping.textContent.trim();
-      return el.getAttribute("name") ?? el.getAttribute("id") ?? "";
+      return el.getAttribute("aria-label") ?? el.getAttribute("placeholder") ?? el.getAttribute("name") ?? el.getAttribute("id") ?? "";
     };
     const out: Array<Record<string, unknown>> = [];
     for (const el of document.querySelectorAll("input, select, textarea")) {
-      if (!visible(el)) continue;
+      const group = el.closest("[data-field-path]");
+      const yesno = !!group?.querySelector("button[data-option]");
+      if (!visible(el) && el.getAttribute("type") !== "file" && !yesno) continue;
       const type = el.getAttribute("type");
       if (type === "hidden" || type === "submit" || type === "button") continue;
       const maxLength = el.getAttribute("maxlength");
       out.push({
-        name: el.getAttribute("name") ?? el.getAttribute("id") ?? "",
+        name: el.getAttribute("name") || el.getAttribute("id") || group?.getAttribute("data-field-path") || "",
         label: labelFor(el),
         tag: el.tagName.toLowerCase(),
-        type,
-        required: el.hasAttribute("required"),
-        options: el.tagName.toLowerCase() === "select"
+        type: yesno ? "radio" : el.getAttribute("role") === "combobox" && el.tagName.toLowerCase() !== "select" ? "custom-combobox" : type,
+        required: el.hasAttribute("required") || el.getAttribute("aria-required") === "true" || /[*✱]/.test(labelFor(el)) || !!group?.querySelector('label[class*="_required_"]'),
+        options: yesno ? ["Yes", "No"] : el.tagName.toLowerCase() === "select"
           ? [...(el as HTMLSelectElement).options].map((o) => o.value).filter(Boolean)
-          : [],
+          : type === "radio" ? [...document.querySelectorAll("input[type=radio]")].filter(r => r.getAttribute("name") === el.getAttribute("name")).map(r => r.getAttribute("value") || "") : type === "checkbox" ? ["Yes", "No"] : [],
         max_length: maxLength ? Number(maxLength) : null,
       });
     }
@@ -122,10 +131,11 @@ async function normalizeFields(page: Page): Promise<FormField[]> {
 
 /** Buttons that advance a multi-step form. Matched by visible text so the worker is not tied to one site's markup. */
 const NEXT_LABELS = ["next", "continue", "weiter"];
+const SUBMIT_SELECTOR = 'button[type=submit]:visible, input[type=submit]:visible, button:has-text("Submit Application"):visible, button:has-text("Bewerbung absenden"):visible';
 
 async function advance(page: Page): Promise<boolean> {
   for (const label of NEXT_LABELS) {
-    const button = page.locator(`button:visible, input[type=button]:visible`).filter({ hasText: new RegExp(label, "i") });
+    const button = page.locator(`button[type=button]:visible, input[type=button]:visible`).filter({ hasText: new RegExp(`^${label}$`, "i") });
     if ((await button.count()) > 0) {
       await button.first().click();
       await page.waitForTimeout(100);
@@ -137,11 +147,11 @@ async function advance(page: Page): Promise<boolean> {
 
 /** Inspect a form, walking every step so dynamically revealed fields are included. */
 export async function inspect(url: string, maxSteps = 6): Promise<FormPlan> {
-  assertNavigable(url);
+  assertSupported(url);
   const browser = await chromium.launch();
   try {
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await openForm(page, url);
 
     const byName = new Map<string, FormField>();
     let steps = 0;
@@ -159,9 +169,9 @@ export async function inspect(url: string, maxSteps = 6): Promise<FormPlan> {
       fields: [...byName.values()],
       steps,
       // A challenge is reported, never attempted. Its presence is what routes the application to a human.
-      has_captcha: /captcha|recaptcha|hcaptcha|turnstile/.test(body),
+      has_captcha: (await page.locator('iframe[src*="captcha"], iframe[src*="turnstile"], [data-sitekey]').count()) > 0 || /verify you are human|complete the captcha/.test(body),
       requires_login: /type="password"|sign in to apply|log in to apply/.test(body),
-      submit_selector: (await page.locator("button[type=submit]:visible").count()) > 0 ? "button[type=submit]" : null,
+      submit_selector: (await page.locator(SUBMIT_SELECTOR).count()) > 0 ? SUBMIT_SELECTOR : null,
     };
   } finally {
     await browser.close();
@@ -180,6 +190,8 @@ export interface FillRequest {
   documentPath?: string;
   /** Identifies the artefact directory. Screenshots land under the private tree keyed by this. */
   reference: string;
+  standingAuthorized?: boolean;
+  documentHash?: string;
 }
 
 export interface FillResult {
@@ -191,15 +203,26 @@ export interface FillResult {
 
 async function setValue(page: Page, field: string, value: string): Promise<boolean> {
   const escaped = field.replace(/"/g, '\\"');
-  const locator = page.locator(`[name="${escaped}"]:visible`).first();
+  const customOptions = page.locator(`[data-field-path="${escaped}"] button[data-option]`);
+  if (await customOptions.count()) {
+    for (const option of await customOptions.all()) {
+      if ((await option.getAttribute("data-option"))?.toLowerCase() === value.toLowerCase()) { await option.click(); return true; }
+    }
+    return false;
+  }
+  const locator = page.locator(`[name="${escaped}"]:visible, [id="${escaped}"]:visible`).first();
   if ((await locator.count()) === 0) return false;
   const tag = await locator.evaluate((el) => el.tagName.toLowerCase());
   const type = await locator.getAttribute("type");
   if (tag === "select") {
     await locator.selectOption(value);
+  } else if (type === "radio") {
+    const radio = page.locator(`input[name="${escaped}"][type=radio]`).filter({ visible: true });
+    for (const el of await radio.all()) if (await el.getAttribute("value") === value) { await el.check(); return true; }
+    return false;
   } else if (type === "checkbox") {
     // Only an explicit affirmative ticks a box. Anything else leaves it alone rather than agreeing on the owner's behalf.
-    if (["yes", "true", "on", "1", "agree"].includes(value.trim().toLowerCase())) await locator.check();
+    await locator.setChecked(["yes", "true", "on", "1", "agree"].includes(value.trim().toLowerCase()));
   } else {
     await locator.fill(value);
   }
@@ -208,14 +231,14 @@ async function setValue(page: Page, field: string, value: string): Promise<boole
 
 /** Fill a form and stop. This never clicks submit, whatever the form offers. */
 export async function fill(request: FillRequest): Promise<FillResult> {
-  assertNavigable(request.url);
+  assertSupported(request.url);
   const directory = join(artefactRoot(), request.reference);
   await mkdir(directory, { recursive: true });
 
   const browser: Browser = await chromium.launch();
   try {
     const page = await browser.newPage();
-    await page.goto(request.url, { waitUntil: "domcontentloaded" });
+    await openForm(page, request.url);
 
     const filled: string[] = [];
     const skipped: string[] = [];
@@ -225,7 +248,7 @@ export async function fill(request: FillRequest): Promise<FillResult> {
         if (await setValue(page, field, value)) filled.push(field);
       }
       if (request.documentPath) {
-        const file = page.locator("input[type=file]:visible").first();
+        const file = page.locator('input[type=file][name*=resume i],input[type=file][name*=cv i],input[type=file][id*=resume i],input[type=file][id*=cv i]').first();
         if ((await file.count()) > 0 && !filled.includes("__document")) {
           await file.setInputFiles(request.documentPath);
           filled.push("__document");
@@ -266,8 +289,14 @@ export type SubmitOutcome =
  * Three outcomes and no others. A receipt means it landed. No answer after the click means nobody knows, which is reported as unknown so a human reconciles it; the worker never retries, because a retry after an uncertain submit is how someone applies twice.
  */
 export async function submit(request: SubmitRequest): Promise<SubmitOutcome> {
-  assertNavigable(request.url);
-  const actual = hashValues(request.values);
+  const provider = assertSupported(request.url, true, request.standingAuthorized === true);
+  let actual = hashValues(request.values);
+  if (request.documentHash) {
+    if (!request.documentPath || createHash("sha256").update(readFileSync(request.documentPath)).digest("hex") !== request.documentHash) {
+      return {state:"failed", diagnostic:"The CV changed after authorization."};
+    }
+    actual = createHash("sha256").update(`${actual}\ncv=${request.documentHash}`).digest("hex");
+  }
   if (actual !== request.authorizedPayloadHash) {
     return { state: "failed", diagnostic: "the answers changed after this submission was authorized" };
   }
@@ -278,75 +307,41 @@ export async function submit(request: SubmitRequest): Promise<SubmitOutcome> {
   let clicked = false;
   try {
     const page = await browser.newPage();
-    await page.goto(request.url, { waitUntil: "domcontentloaded" });
+    await openForm(page, request.url);
     for (let step = 0; step < 6; step += 1) {
       for (const { field, value } of request.values) await setValue(page, field, value);
       if (request.documentPath) {
-        const file = page.locator("input[type=file]:visible").first();
+        const file = page.locator('input[type=file][name*=resume i],input[type=file][name*=cv i],input[type=file][id*=resume i],input[type=file][id*=cv i]').first();
         if ((await file.count()) > 0) await file.setInputFiles(request.documentPath);
       }
       if (!(await advance(page))) break;
     }
 
-    const submitButton = page.locator("button[type=submit]:visible").first();
+    const submitButton = page.locator(SUBMIT_SELECTOR).first();
     if ((await submitButton.count()) === 0) {
       return { state: "failed", diagnostic: "no submit control was found on the form" };
     }
 
-    const timeout = request.submitTimeoutMs ?? 8000;
-    // From here on, nobody can prove nothing was sent.
+    const body = (await page.locator("body").innerText()).toLowerCase();
+    const challenge = await page.locator('iframe[src*="captcha"], iframe[src*="turnstile"], [data-sitekey]').count();
+    if (challenge || /verify you are human|complete the captcha/.test(body)) return {state:"failed",diagnostic:"The employer requires a verification challenge. Nothing was sent."};
+    if (await receiptOn(page, provider)) return {state:"failed",diagnostic:"Confirmation was already present before submission; refusing an ambiguous form."};
+    const missing = await page.locator("input:invalid, select:invalid, textarea:invalid").count();
+    if (missing) return {state:"failed",diagnostic:"Required fields were not accepted. Nothing was sent."};
+    const timeout = request.submitTimeoutMs ?? 12000;
     if (request.progressPath) writeFileSync(request.progressPath, new Date().toISOString());
     clicked = true;
-    try {
-      // Waiting for the navigation the submission causes, not for a load state: the form page has already loaded, so a load state resolves at once and would hide a server that never answers.
-      await Promise.all([
-        page.waitForURL((candidate) => candidate.pathname.startsWith("/submit"), { timeout }),
-        submitButton.click(),
-      ]);
-    } catch {
-      const screenshot = join(directory, "after-submit-unknown.png");
-      await page.screenshot({ path: screenshot, fullPage: true }).catch(() => undefined);
-      // The distinction that matters most in this whole worker. If the browser's own validation refused the form, nothing left the machine and trying again is safe, so this is a failure. If the form was valid and the site simply never answered, nobody knows whether it landed, and that must block retries.
-      const invalid = await withTimeout(
-        page.evaluate(() => {
-          const form = document.querySelector("form");
-          if (!form || form.checkValidity()) return null;
-          return [...form.elements]
-            .filter((el) => typeof (el as HTMLObjectElement).checkValidity === "function")
-            .filter((el) => !(el as HTMLObjectElement).checkValidity())
-            .map((el) => el.getAttribute("name") ?? el.getAttribute("id") ?? "unnamed");
-        }),
-        2000,
-      ).catch(() => null);
-      if (invalid && invalid.length > 0) {
-        return {
-          state: "failed",
-          diagnostic: `the form refused to submit because these required fields were not accepted: ${invalid.join(", ")}. Nothing was sent.`,
-        };
-      }
-      return {
-        state: "unknown",
-        diagnostic: "the form was submitted but the site did not answer, so whether it was recorded is unknown",
-        screenshot,
-      };
+    await submitButton.click({timeout});
+    const deadline = Date.now() + timeout;
+    let receipt: string | null = null;
+    while (Date.now() < deadline && !receipt) {
+      receipt = await receiptOn(page, provider).catch(() => null);
+      if (!receipt) await page.waitForTimeout(200);
     }
-
-    const screenshot = join(directory, "after-submit.png");
+    const screenshot = join(directory, receipt ? "after-submit.png" : "after-submit-unknown.png");
     await page.screenshot({ path: screenshot, fullPage: true }).catch(() => undefined);
-    const receipt = await page
-      .locator("#receipt")
-      .first()
-      .textContent({ timeout })
-      .catch(() => null);
-    if (!receipt) {
-      // The page answered but produced no confirmation. That is not success.
-      return {
-        state: "unknown",
-        diagnostic: "the site answered but published no confirmation reference",
-        screenshot,
-      };
-    }
-    return { state: "submitted", receipt: receipt.trim(), screenshot };
+    if (!receipt) return {state:"unknown",diagnostic:"No employer confirmation was observed. Check with the employer before retrying.",screenshot};
+    return {state:"submitted",receipt:receipt.trim(),screenshot};
   } catch (error) {
     // Anything that goes wrong after the click is an uncertain outcome, not a failure. A renderer killed by the kernel reaches here, and "the browser crashed" says nothing about whether the form had already gone.
     if (clicked) {
@@ -360,14 +355,6 @@ export async function submit(request: SubmitRequest): Promise<SubmitOutcome> {
   } finally {
     await browser.close();
   }
-}
-
-/** Resolve a promise or give up, so a page stuck mid-navigation cannot hold the worker for the default thirty seconds. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("timed out")), ms)),
-  ]);
 }
 
 /**

@@ -169,7 +169,7 @@ if a[0]=='image':
     if f=='{{.Id}}':print(identity)
     elif f=='{{.Architecture}}':print('amd64')
     elif f=='{{.Architecture}} {{.Os}}':print('amd64 linux')
-    elif 'revision' in f:print('b'*40)
+    elif 'revision' in f:print('b'*40 if identity==s['new_id'] else s.get('old_revision','a'*40))
     elif 'title' in f:print('opportunity-runtime')
     else:print('1000')
 elif a[0]=='tag':s['images'][a[2]]=image(a[1]);save()
@@ -182,7 +182,19 @@ elif a[0]=='save':
     sys.exit(43 if s.get('save_failure') else 0)
 elif a[0]=='run':sys.exit(42 if s.get('run_failure') else 0)
 elif a[0]=='compose':
-    if 'ps' in a:
+    if 'exec' in a:
+        command=a[-1]
+        if 'psql -XAt' in command:
+            sys.stdin.read()
+            if s.get('migrations'):print('\n'.join(s['migrations']))
+            sys.exit(5 if s.get('migration_query_failure') else 0)
+        if 'pg_dump' in command:
+            sys.stdout.buffer.write(b'not a dump' if s.get('bad_dump') else b'PGDMP'+b'synthetic dump '*64);sys.stdout.flush()
+            sys.exit(3 if s.get('dump_failure') else 0)
+        if 'tar' in a:
+            sys.stdout.buffer.write(gzip.compress(b'synthetic private tree'));sys.stdout.flush()
+            sys.exit(4 if s.get('tar_failure') else 0)
+    elif 'ps' in a:
         if '-q' in a or '-aq' in a: print('app' if a[-1]=='app' else 'db')
         else: print('app Up\ndb Up')
     elif 'up' in a:
@@ -245,7 +257,7 @@ class DeploymentTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = pathlib.Path(self.tmp.name); self.vm = self.root / "vm"
         for name in ["scripts", "bin", "vm"]: (self.root / name).mkdir()
-        for name in ["deploy-vm.sh", "vm-release.sh", "release-artifact.py", "release-image.sh"]:
+        for name in ["deploy-vm.sh", "vm-release.sh", "release-artifact.py", "release-image.sh", "release-gate.py", "backup-stream.py"]:
             shutil.copy2(BASE / "scripts" / name, self.root / "scripts" / name)
         self.archive, self.new_id = archive_fixture(self.root)
         self.state = {"images": {"fixture:old": OLD_ID}, "running_tag": "fixture:old", "running_id": OLD_ID,
@@ -453,6 +465,230 @@ class ReadinessTests(unittest.TestCase):
         self.flags(running_mode='cloudflare')
         r=subprocess.run(['sh','vm-check.sh'],cwd=self.vm,env=self.env,capture_output=True,text=True,timeout=15)
         self.assertNotEqual(r.returncode,0)
+
+
+
+class GateTests(unittest.TestCase):
+    """release-gate.py against a real Git history. Its only production input is what the VM reports
+    (image revision label, SQLx checksums), so Actions history (skipped, failed or successful runs of
+    other commits) cannot make it believe production runs something else."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.repo = pathlib.Path(self.tmp.name) / "repo"; (self.repo / "migrations").mkdir(parents=True)
+        self.git("init", "-q", "-b", "master")
+        self.migration("0001_base.sql", "create table a (id int);\n"); self.A = self.commit("base")
+        (self.repo / "code.txt").write_text("v2\n"); self.B = self.commit("code only")
+        self.migration("0002_more.sql", "create table b (id int);\n"); self.C = self.commit("adds a migration")
+        self.migration("0001_base.sql", "create table a (id bigint);\n"); self.D = self.commit("edits an applied migration")
+        self.git("checkout", "-q", "-b", "side", self.A)
+        (self.repo / "side.txt").write_text("x\n"); self.SIDE = self.commit("not on master")
+        self.git("checkout", "-q", "master")
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "-C", str(self.repo), *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
+    def migration(self, name, sql): (self.repo / "migrations" / name).write_text(sql)
+    def commit(self, message):
+        self.git("add", "-A"); self.git("commit", "-q", "-m", message); return self.git("rev-parse", "HEAD")
+    def checksums(self, revision):
+        out = {}
+        for name in self.git("ls-tree", "--name-only", revision, "migrations/").splitlines():
+            body = subprocess.run(["git", "-C", str(self.repo), "show", f"{revision}:{name}"], capture_output=True, check=True).stdout
+            out[int(pathlib.Path(name).name.split("_")[0])] = hashlib.sha384(body).hexdigest()
+        return out
+    def status(self, revision, migrations=None, extra=""):
+        migrations = self.checksums(revision) if migrations is None else migrations
+        lines = ["Configured image: opportunity-app:fixture", "No pending release journal", f"DEPLOYED_REVISION={revision}",
+                 "DEPLOYED_IMAGE=sha256:" + "e" * 64] + [f"MIGRATION={v}:{c}" for v, c in sorted(migrations.items())] + ["MIGRATIONS_END"]
+        return extra + "\n".join(lines) + "\n"
+    def gate(self, candidate, status, *extra):
+        self.git("checkout", "-q", candidate)
+        path = pathlib.Path(self.tmp.name) / "status.txt"; path.write_text(status)
+        return subprocess.run(["python3", str(BASE / "scripts/release-gate.py"), "--repo", str(self.repo), "--status", str(path),
+                               "--candidate", candidate, "--trusted-ref", "master", *extra], capture_output=True, text=True)
+    def assert_refused(self, result, reason):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr); self.assertIn(reason, result.stdout)
+
+    def test_code_only_candidate_deploys(self):
+        r = self.gate(self.B, self.status(self.A)); self.assertEqual(r.returncode, 0, r.stdout); self.assertIn("code-only", r.stdout)
+    def test_repeated_trigger_for_the_running_revision_is_a_no_op(self):
+        self.assertEqual(self.gate(self.B, self.status(self.B)).returncode, 10)
+    def test_new_migration_is_never_automatic(self):
+        self.assert_refused(self.gate(self.C, self.status(self.B)), "schema change (0002_more.sql)")
+    def test_migration_edited_after_production_applied_it(self):
+        self.assert_refused(self.gate(self.D, self.status(self.C)), "0001_base.sql changed after production applied it")
+    def test_out_of_band_build_production_runs_is_refused(self):
+        self.assert_refused(self.gate(self.B, self.status("f" * 40, self.checksums(self.A))), "does not know")
+    def test_actions_history_cannot_substitute_for_production_state(self):
+        # Production really runs C (two migrations), whatever an Actions run for B claimed.
+        self.assert_refused(self.gate(self.B, self.status(self.C)), "does not descend")
+    def test_candidate_off_the_trusted_branch_is_refused(self):
+        self.assert_refused(self.gate(self.SIDE, self.status(self.A)), "not on master")
+    def test_unresolved_or_partial_release_is_refused(self):
+        self.assert_refused(self.gate(self.B, "UNRESOLVED release=x phase=started\n"), "unresolved release journal")
+    def test_concurrent_release_holding_the_vm_lock_is_refused(self):
+        self.assert_refused(self.gate(self.B, "Another release operation is still active; state is unresolved\n"), "did not report its migration history")
+    def test_missing_revision_label_is_refused(self):
+        self.assert_refused(self.gate(self.B, self.status(self.A).replace(f"DEPLOYED_REVISION={self.A}", "DEPLOYED_REVISION=")), "did not report a revision")
+    def test_out_of_order_migration_is_refused(self):
+        migrations = self.checksums(self.C); migrations[3] = migrations.pop(2)
+        self.migration("0002_more.sql", "create table b (id int);\n")
+        self.assert_refused(self.gate(self.C, self.status(self.B, migrations)), "applied migration 3")
+    def test_dirty_migrations_and_wrong_checkout_are_refused(self):
+        self.git("checkout", "-q", self.B); self.migration("0009_local.sql", "select 1;\n")
+        path = pathlib.Path(self.tmp.name) / "status.txt"; path.write_text(self.status(self.A))
+        r = subprocess.run(["python3", str(BASE / "scripts/release-gate.py"), "--repo", str(self.repo), "--status", str(path), "--candidate", self.B, "--trusted-ref", "master"], capture_output=True, text=True)
+        self.assert_refused(r, "uncommitted changes")
+        (self.repo / "migrations/0009_local.sql").unlink()
+        r = subprocess.run(["python3", str(BASE / "scripts/release-gate.py"), "--repo", str(self.repo), "--status", str(path), "--candidate", self.A, "--trusted-ref", "master"], capture_output=True, text=True)
+        self.assert_refused(r, "not the candidate")
+
+    def recovery_point(self, revision, age_hours=1, verified=True, tamper=False):
+        directory = pathlib.Path(self.tmp.name) / f"backup-{age_hours}-{verified}-{tamper}-{revision[:6]}"; directory.mkdir()
+        for name in ("database.dump.gpg", "private.tar.gz.gpg"): (directory / name).write_bytes(b"ciphertext " + name.encode())
+        import datetime as dt
+        created = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=age_hours)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        manifest = {"format": 1, "created_at": created, "production_revision": revision,
+                    "migrations": {str(k): v for k, v in self.checksums(revision).items()},
+                    "files": {n: {"sha256": hashlib.sha256((directory / n).read_bytes()).hexdigest()} for n in ("database.dump.gpg", "private.tar.gz.gpg")}}
+        data = json.dumps(manifest).encode(); (directory / "manifest.json").write_bytes(data)
+        if verified:
+            (directory / "restore-verified.json").write_text(json.dumps({"ok": True, "documents_missing": 0, "manifest_sha256": hashlib.sha256(data).hexdigest()}))
+        if tamper: (directory / "database.dump.gpg").write_bytes(b"truncated")
+        return directory
+    def test_migration_rollout_with_a_verified_fresh_recovery_point(self):
+        r = self.gate(self.C, self.status(self.B), "--rollout-manifest", str(self.recovery_point(self.B)))
+        self.assertEqual(r.returncode, 0, r.stdout); self.assertIn("migration rollout of 0002_more.sql", r.stdout)
+    def test_migration_rollout_refuses_unverified_stale_foreign_or_tampered_backups(self):
+        for point, reason in [(self.recovery_point(self.B, verified=False), "restore-rehearsal"),
+                              (self.recovery_point(self.B, age_hours=30), "older than 24 hours"),
+                              (self.recovery_point(self.A), "different production revision"),
+                              (self.recovery_point(self.B, tamper=True), "does not match its manifest")]:
+            self.assert_refused(self.gate(self.C, self.status(self.B), "--rollout-manifest", str(point)), reason)
+
+
+class DeployGateTests(unittest.TestCase):
+    """The gate inside the real deploy-vm.sh/vm-release.sh path, on the simulated VM."""
+    setUp = DeploymentTests.setUp; write_state = DeploymentTests.write_state
+    flags = DeploymentTests.flags; invoke = DeploymentTests.invoke
+    def assert_untouched(self, result, code):
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        s = json.loads(self.state_path.read_text()); self.assertEqual(s["running_id"], OLD_ID); self.assertEqual(s["checks"], [])
+        self.assertEqual(sorted(s["images"]), ["fixture:old"]); self.assertFalse((self.vm / ".release-state").exists())
+    def test_redeploying_the_running_revision_changes_nothing(self):
+        self.flags(old_revision=SHA); r = self.invoke(); self.assert_untouched(r, 0); self.assertIn("already runs", r.stdout)
+    def test_schema_change_is_refused_before_any_mutation(self):
+        (self.root / "migrations").mkdir(); (self.root / "migrations/0001_new.sql").write_text("select 1;\n")
+        r = self.invoke(); self.assert_untouched(r, 1); self.assertIn("schema change", r.stdout)
+    def test_applied_migration_missing_from_candidate_is_refused(self):
+        self.flags(migrations=["1:" + "0" * 96]); r = self.invoke(); self.assert_untouched(r, 1); self.assertIn("lacks", r.stdout)
+    def test_unreadable_migration_history_is_refused(self):
+        self.flags(migration_query_failure=True); r = self.invoke(); self.assert_untouched(r, 1)
+    def test_unresolved_journal_refuses_with_unresolved_status(self):
+        (self.vm / ".release-state").mkdir(); (self.vm / ".release-state/token").write_text("t\n"); (self.vm / ".release-state/phase").write_text("started\n")
+        r = self.invoke(); self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(json.loads(self.state_path.read_text())["running_id"], OLD_ID)
+    def test_gate_mode_reports_without_mutation(self):
+        r = self.invoke("--gate"); self.assert_untouched(r, 0); self.assertIn("code-only", r.stdout)
+        self.flags(old_revision=SHA); self.assertEqual(self.invoke("--gate").returncode, 10)
+    def test_status_reports_revision_and_migrations(self):
+        self.flags(migrations=["1:" + "a" * 96]); r = self.invoke("--status")
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn("DEPLOYED_REVISION=" + "a" * 40, r.stdout)
+        self.assertIn("MIGRATION=1:" + "a" * 96, r.stdout); self.assertIn("MIGRATIONS_END", r.stdout)
+    def gcloud(self):
+        log = self.root / "gcloud.log"
+        (self.root / "bin/gcloud").write_text("#!/usr/bin/env python3\nimport os,subprocess,sys\na=sys.argv[1:]\nopen(os.environ['GCLOUD_LOG'],'a').write(' '.join(a)+'\\n')\n"
+            "if a[:2]==['auth','list']:print('fixture@example.test');sys.exit(0)\n"
+            "if a[:2]==['compute','ssh']:\n    c=a[a.index('--command')+1]\n    if 'REMOTE_PROBLEMS=' in c:print('REMOTE_PROBLEMS=0');sys.exit(0)\n    sys.exit(subprocess.run(c,shell=True).returncode)\n"
+            "if a[:2]==['compute','scp']:sys.exit(0)\n")
+        (self.root / "bin/gcloud").chmod(0o755); return log
+    def test_preflight_is_read_only_and_transfer_check_says_it_writes(self):
+        log = self.gcloud(); env = dict(TRANSPORT="iap", GCLOUD_LOG=str(log))
+        r = self.invoke("--preflight", **env); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("scp", log.read_text()); self.assertNotIn("rm -f", log.read_text())
+        r = self.invoke("--check-transfer", **env); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("compute scp", log.read_text()); self.assertIn("rm -f", log.read_text())
+
+
+FINGERPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
+FAKE_GPG = r"""#!/usr/bin/env python3
+import json,os,sys
+a=sys.argv[1:];keys=json.loads(os.environ.get('FAKE_GPG_KEYS','[]'))
+if '--list-keys' in a:
+    found=[k for k in keys if k['fpr']==a[-1]]
+    for k in found:print('pub:%s:4096:1:%s:1700000000:::u:::%s:'%(k.get('validity','u'),k['fpr'][-16:],k.get('caps','scESC')));print('fpr:::::::::%s:'%k['fpr'])
+    sys.exit(0 if found else 2)
+if '--encrypt' in a:
+    data=sys.stdin.buffer.read()
+    if os.environ.get('FAKE_GPG_FAIL'):sys.exit(2)
+    open(a[a.index('--output')+1],'wb').write(b'ENC'+data)
+"""
+
+
+class BackupTests(unittest.TestCase):
+    setUp_deploy = DeploymentTests.setUp; write_state = DeploymentTests.write_state; flags = DeploymentTests.flags
+    def setUp(self):
+        self.setUp_deploy()
+        (self.root / "bin/gpg").write_text(FAKE_GPG); (self.root / "bin/gpg").chmod(0o755)
+        self.out = self.root / "backups"
+        self.env.update(BACKUP_OUT_DIR=str(self.out), BACKUP_ENCRYPT_TO=FINGERPRINT, FAKE_GPG_KEYS=json.dumps([{"fpr": FINGERPRINT}]))
+        self.flags(migrations=["1:" + "a" * 96])
+    def fetch(self, **env):
+        return subprocess.run(["bash", "scripts/deploy-vm.sh", "--fetch-backup"], cwd=self.root, env=dict(self.env, **env), capture_output=True, text=True, timeout=30)
+    def backups(self): return sorted(p.name for p in self.out.iterdir()) if self.out.exists() else []
+    def test_complete_backup_has_manifest_checksums_and_production_state(self):
+        r = self.fetch(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [name] = self.backups(); self.assertTrue(name.startswith("opportunity-")); directory = self.out / name
+        manifest = json.loads((directory / "manifest.json").read_text())
+        self.assertEqual(manifest["production_revision"], "a" * 40); self.assertEqual(manifest["migrations"], {"1": "a" * 96})
+        self.assertEqual(manifest["recipient"], FINGERPRINT)
+        for file in ("database.dump.gpg", "private.tar.gz.gpg"):
+            self.assertEqual(hashlib.sha256((directory / file).read_bytes()).hexdigest(), manifest["files"][file]["sha256"])
+            self.assertTrue((directory / (file + ".sha256")).read_text().startswith(manifest["files"][file]["sha256"]))
+        self.assertEqual(oct(directory.stat().st_mode & 0o777), "0o700")
+        verify = subprocess.run(["python3", "scripts/backup-stream.py", "verify", str(directory)], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+        (directory / "private.tar.gz.gpg").write_bytes((directory / "private.tar.gz.gpg").read_bytes()[:-3])
+        verify = subprocess.run(["python3", "scripts/backup-stream.py", "verify", str(directory)], cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(verify.returncode, 0); self.assertIn("truncated", verify.stderr)
+        (directory / "private.tar.gz.gpg").unlink()
+        verify = subprocess.run(["python3", "scripts/backup-stream.py", "verify", str(directory)], cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(verify.returncode, 0); self.assertIn("missing", verify.stderr)
+    def test_interrupted_or_invalid_streams_leave_nothing_and_keep_earlier_backups(self):
+        self.out.mkdir(); earlier = self.out / "opportunity-20260101T000000Z"; earlier.mkdir(); (earlier / "manifest.json").write_text("{}")
+        for flag, env in [("dump_failure", {}), ("tar_failure", {}), ("bad_dump", {}), (None, {"FAKE_GPG_FAIL": "1"})]:
+            self.flags(dump_failure=False, tar_failure=False, bad_dump=False)
+            if flag: self.flags(**{flag: True})
+            r = self.fetch(**env); self.assertNotEqual(r.returncode, 0, (flag, r.stdout + r.stderr))
+            self.assertEqual(self.backups(), [earlier.name], flag); self.assertEqual((earlier / "manifest.json").read_text(), "{}")
+    def test_recipient_must_be_one_valid_encryption_key_named_by_fingerprint(self):
+        cases = [("owner@example.test", [], "full fingerprint"), ("ABCDEF0123456789", [], "full fingerprint"),
+                 (FINGERPRINT, [], "no public key"), (FINGERPRINT, [{"fpr": FINGERPRINT}, {"fpr": FINGERPRINT}], "exactly one"),
+                 (FINGERPRINT, [{"fpr": FINGERPRINT, "validity": "r"}], "revoked"), (FINGERPRINT, [{"fpr": FINGERPRINT, "caps": "scSC"}], "no usable encryption")]
+        for recipient, keys, reason in cases:
+            r = self.fetch(BACKUP_ENCRYPT_TO=recipient, FAKE_GPG_KEYS=json.dumps(keys))
+            self.assertNotEqual(r.returncode, 0, recipient); self.assertIn(reason, r.stderr); self.assertEqual(self.backups(), [])
+        r = self.fetch(BACKUP_ENCRYPT_TO=FINGERPRINT.lower()); self.assertEqual(r.returncode, 0, r.stderr)
+    def test_attest_requires_every_referenced_cv_with_its_recorded_bytes(self):
+        r = self.fetch(); self.assertEqual(r.returncode, 0, r.stderr); directory = self.out / self.backups()[0]
+        work = self.root / "work"; work.mkdir()
+        cv = b"synthetic cv"; buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            member = tarfile.TarInfo("private/documents/one.txt"); member.size = len(cv); archive.addfile(member, io.BytesIO(cv))
+        (work / "private.tar.gz").write_bytes(buffer.getvalue()); (work / "database.dump").write_bytes(b"PGDMP fixture")
+        manifest = json.loads((directory / "manifest.json").read_text())
+        manifest["files"]["database.dump.gpg"]["plaintext_sha256"] = hashlib.sha256(b"PGDMP fixture").hexdigest()
+        manifest["files"]["private.tar.gz.gpg"]["plaintext_sha256"] = hashlib.sha256(buffer.getvalue()).hexdigest()
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+        (work / "migrations.txt").write_text("1:" + "a" * 96 + "\n"); (work / "tables.txt").write_text("54\n")
+        attest = lambda: subprocess.run(["python3", "scripts/backup-stream.py", "attest", str(directory), str(work)], cwd=self.root, capture_output=True, text=True)
+        (work / "documents.tsv").write_text("private/documents/one.txt\t" + hashlib.sha256(cv).hexdigest() + "\nprivate/documents/two.pdf\t" + "0" * 64 + "\n")
+        r = attest(); self.assertNotEqual(r.returncode, 0); self.assertIn("two.pdf", r.stderr); self.assertFalse((directory / "restore-verified.json").exists())
+        (work / "documents.tsv").write_text("/app/private/documents/one.txt\t" + hashlib.sha256(cv).hexdigest() + "\n")
+        r = attest(); self.assertEqual(r.returncode, 0, r.stderr)
+        verified = json.loads((directory / "restore-verified.json").read_text())
+        self.assertEqual((verified["ok"], verified["documents_checked"], verified["documents_missing"]), (True, 1, 0))
+        self.assertEqual(verified["manifest_sha256"], hashlib.sha256((directory / "manifest.json").read_bytes()).hexdigest())
+        (work / "migrations.txt").write_text("1:" + "b" * 96 + "\n"); self.assertNotEqual(attest().returncode, 0)
 
 
 if __name__ == "__main__":

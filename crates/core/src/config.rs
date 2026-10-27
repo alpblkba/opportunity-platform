@@ -96,11 +96,27 @@ impl SourceEntry {
 pub struct ImportReport {
     pub created: Vec<String>,
     pub skipped_existing: Vec<String>,
+    /// Seeded by an earlier release and since deleted by the owner, so left deleted.
+    pub skipped_previously_seeded: Vec<String>,
     pub rejected: Vec<(String, String)>,
 }
 
-/// Import a source file. Entries that already exist are left alone so an import never overwrites an edit the owner made in the UI, and entries that fail validation are reported rather than silently dropped.
+/// Import a source file the owner chose to import. Entries that already exist are left alone so an import never overwrites an edit the owner made in the UI, and entries that fail validation are reported rather than silently dropped. Being the owner's explicit act, it may recreate a source they deleted.
 pub async fn import_sources(pool: &Db, toml_text: &str) -> Result<ImportReport, SourceError> {
+    import(pool, toml_text, false).await
+}
+
+/// The seed compiled into a release, imported at every start. It adds sources a new release
+/// introduces and never recreates one the owner deleted: each key is created at most once.
+pub async fn import_release_seed(pool: &Db, toml_text: &str) -> Result<ImportReport, SourceError> {
+    import(pool, toml_text, true).await
+}
+
+async fn import(
+    pool: &Db,
+    toml_text: &str,
+    release_seed: bool,
+) -> Result<ImportReport, SourceError> {
     let parsed: SourcesFile =
         toml::from_str(toml_text).map_err(|e| SourceError::Invalid(e.to_string()))?;
     let mut report = ImportReport::default();
@@ -120,6 +136,16 @@ pub async fn import_sources(pool: &Db, toml_text: &str) -> Result<ImportReport, 
             report.skipped_existing.push(entry.key.clone());
             continue;
         }
+        let seeded: bool =
+            sqlx::query_scalar("select exists(select 1 from seed_ledger where key = $1)")
+                .bind(&entry.key)
+                .fetch_one(pool)
+                .await
+                .map_err(SourceError::from)?;
+        if release_seed && seeded {
+            report.skipped_previously_seeded.push(entry.key.clone());
+            continue;
+        }
         let display_name = match &entry.notes {
             Some(notes) if !notes.trim().is_empty() => {
                 format!("{} ({})", entry.organization, notes.trim())
@@ -136,7 +162,14 @@ pub async fn import_sources(pool: &Db, toml_text: &str) -> Result<ImportReport, 
             tags: entry.tags.clone(),
         };
         match sources::create(pool, new_source).await {
-            Ok(_) => report.created.push(entry.key),
+            Ok(_) => {
+                sqlx::query("insert into seed_ledger (key) values ($1) on conflict do nothing")
+                    .bind(&entry.key)
+                    .execute(pool)
+                    .await
+                    .map_err(SourceError::from)?;
+                report.created.push(entry.key)
+            }
             Err(SourceError::Invalid(reason)) => report.rejected.push((entry.key, reason)),
             Err(other) => return Err(other),
         }

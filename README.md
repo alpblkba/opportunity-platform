@@ -1,25 +1,11 @@
-# Opportunity platform
+# Opportunity Platform
 
-A personal application for discovering, filtering and tracking jobs, internships and thesis opportunities.
+Private, single-owner job discovery and applications. Sign in, upload a PDF or text CV once, and choose one of five career profiles. The stored CV drives current ranked opportunities, application status and employer questions on one screen.
 
-The application collects postings from supported public sources, stores them in PostgreSQL and provides search, matching and application tracking through a web interface.
+Run locally with `./run.sh` (Rust, Node.js, PostgreSQL and `pdftotext` for PDFs). Open http://127.0.0.1:8787. Existing accounts remain valid; create an initial owner with `target/release/opportunity user create --email <your-address>` after loading `.env`.
 
-## Stack
+Automatic applications require an explicit employer/profile authorization in the application. Greenhouse, Lever and Ashby hosted forms are inspected locally; unsupported controls, login and CAPTCHA require manual completion. A visible employer confirmation is required for success. Set `APPLICATION_ENV=development` to prohibit real submissions during testing.
 
-Rust, Axum, SQLx, PostgreSQL, React, TypeScript and Docker.
+For email notifications, configure `MAIL_API_KEY`, `MAIL_FROM`, and `MAIL_TO` in the ignored `.env`. The default delivery API is Resend; `MAIL_API_URL` can point to a compatible transport. Acceptance is recorded separately from provider-confirmed delivery. No notification credentials are included.
 
-## Local setup
-
-Requires Rust, Node.js 22 or newer, and Docker with PostgreSQL 16.
-
-Start the application:
-
-`./run.sh`
-
-The web interface is available at `http://127.0.0.1:8787`.
-
-Stop the application with Ctrl+C. Run `./stop.sh` to stop the local database.
-
-## Current limitations
-
-The application currently supports one owner account. Matching is rule-based, with no semantic ranking. External employer application submissions are disabled by default.
+Product acceptance journey: `TEST_OFFLINE=1 node scripts/test-product.mjs` (run in CI). It uses an isolated PostgreSQL database, a synthetic CV and ranking corpus, and loopback-only application/mail fixtures, with every source disabled. Without `TEST_OFFLINE` it also waits for live discovery from real public listings, as a smoke test. Real applications and real recipient emails are never sent. Ranking rules: [docs/RANKING_POLICY.md](docs/RANKING_POLICY.md).

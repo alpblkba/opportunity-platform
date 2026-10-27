@@ -166,14 +166,7 @@ pub async fn run_due(
     http: &HttpClient,
     pacer: &mut HostPacer,
 ) -> Result<usize, SourceError> {
-    // Both the background loop and a manual refresh come through here, so the lock is taken here rather than at each call site, where one could forget it.
-    let Some(lease) = WorkLease::try_acquire(pool).await? else {
-        tracing::info!("another refresh or a browser run is in progress; skipping this sweep");
-        return Ok(0);
-    };
-    let result = run_due_locked(pool, http, pacer).await;
-    lease.release().await;
-    result
+    run_due_locked(pool, http, pacer).await
 }
 
 async fn run_due_locked(
@@ -195,6 +188,10 @@ async fn run_due_locked(
         if !endpoint.kind().has_adapter() {
             continue;
         }
+        // Let a pending application run between sources instead of waiting for the entire catalogue.
+        let Some(lease) = WorkLease::try_acquire(pool).await? else {
+            break;
+        };
         pacer.wait_for(&provider_host(&source.kind)).await;
         let scan = opportunity_adapters::scan(http, &endpoint).await;
         let outcome = scan.outcome;
@@ -210,6 +207,7 @@ async fn run_due_locked(
             }
         }
         record_schedule(pool, source, outcome).await?;
+        lease.release().await;
         attempted += 1;
     }
     Ok(attempted)

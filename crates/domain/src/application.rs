@@ -113,6 +113,8 @@ pub struct OpenQuestion {
     /// A suggestion assembled from approved facts, or nothing. Never a guess at a fact the owner has not confirmed.
     pub draft: Option<String>,
     pub reason: String,
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 /// The complete result of mapping a form against the facts on hand.
@@ -223,11 +225,32 @@ pub fn map_form(
                 field: field.name.clone(),
                 label: field.label.clone(),
                 kind: field.kind,
+                options: field.options.clone(),
                 required: field.required,
                 sensitive: false,
                 draft: None,
                 reason: "this tool does not know how to operate this control safely".into(),
             });
+            continue;
+        }
+        if field.kind == FieldKind::File
+            && !["cv", "resume", "résumé", "lebenslauf"].iter().any(|word| {
+                field.name.to_lowercase().contains(word)
+                    || field.label.to_lowercase().contains(word)
+            })
+        {
+            if field.required {
+                open.push(OpenQuestion {
+                    field: field.name.clone(),
+                    label: field.label.clone(),
+                    kind: FieldKind::Unsupported,
+                    required: true,
+                    sensitive: false,
+                    draft: None,
+                    options: vec![],
+                    reason: "Attach this document on the employer website.".into(),
+                });
+            }
             continue;
         }
         if field.kind == FieldKind::File {
@@ -260,6 +283,7 @@ pub fn map_form(
                 field: field.name.clone(),
                 label: field.label.clone(),
                 kind: field.kind,
+                options: field.options.clone(),
                 required: field.required,
                 sensitive,
                 draft: None,
@@ -281,6 +305,7 @@ pub fn map_form(
                 field: field.name.clone(),
                 label: field.label.clone(),
                 kind: field.kind,
+                options: field.options.clone(),
                 required: field.required,
                 sensitive: true,
                 // The owner has approved a value, so it is offered as a draft, but a sensitive question is still confirmed each time.
@@ -291,6 +316,7 @@ pub fn map_form(
                 field: field.name.clone(),
                 label: field.label.clone(),
                 kind: field.kind,
+                options: field.options.clone(),
                 required: field.required,
                 sensitive,
                 draft: None,
@@ -303,6 +329,7 @@ pub fn map_form(
         }
     }
 
+    open.retain(|q| q.required || q.sensitive);
     let unresolved_required = open.iter().filter(|q| q.required).count();
     let (route, reason) = if plan.has_captcha {
         (
@@ -358,7 +385,13 @@ fn key_matches(key: &str, field_name: &str, label: &str) -> bool {
     }
     let name_folded = normalize_location(Some(field_name));
     let label_folded = normalize_location(Some(label));
-    key_folded == name_folded || key_folded == label_folded
+    key_folded == name_folded
+        || key_folded == label_folded
+        || key_folded == "full name" && (name_folded == "name" || label_folded == "name")
+        || key_folded == "email"
+            && (name_folded == "email address" || label_folded == "email address")
+        || key_folded == "phone"
+            && (name_folded == "phone number" || label_folded == "phone number")
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod documents;
 pub mod error;
 pub mod personalization;
+pub mod product;
 pub mod routes;
 
 pub use access::{AccessMode, Identity};
