@@ -52,6 +52,8 @@ enum Command {
     },
     /// Print counts of what the database currently holds.
     Stats,
+    /// Print operational status: queue, sources, notifications, release. Run on the VM with docker exec.
+    Ops,
     /// Print the coverage table: what is verified live, fixture only, blocked or manual.
     Coverage,
     /// Create and manage the accounts that may log in. The only way an account comes into existence.
@@ -159,6 +161,10 @@ async fn main() -> Result<()> {
         Command::Stats => println!(
             "{}",
             serde_json::to_string_pretty(&query::stats(&db).await?)?
+        ),
+        Command::Ops => println!(
+            "{}",
+            serde_json::to_string_pretty(&opportunity_core::ops::status(&db).await?)?
         ),
         Command::Coverage => print_coverage(&db).await?,
         Command::User(command) => user_command(&db, command).await?,

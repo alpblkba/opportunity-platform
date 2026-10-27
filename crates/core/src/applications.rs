@@ -209,24 +209,99 @@ pub async fn list_applications(pool: &Db) -> Result<Vec<Application>, AppError> 
     .await?)
 }
 
+/// The statuses the system may move an application *from* into `to`. Owner tracking edits go through
+/// `update_tracking` instead. Submitted, uncertain, withdrawn, rejected and interview are reachable
+/// only from submitting or by the owner, and nothing automatic leaves them: an uncertain outcome is
+/// never retried blindly and a receipt is never overwritten.
+pub fn allowed_from(to: &str) -> &'static [&'static str] {
+    match to {
+        "preparing" => &["saved", "needs_review", "ready", "failed"],
+        // Prepare's outcome, or prepare restoring the status it found.
+        "saved" => &["preparing"],
+        "needs_review" | "ready" => &["saved", "preparing", "needs_review", "ready"],
+        "submitting" => &["saved", "preparing", "needs_review", "ready", "failed"],
+        "submitted" | "submission_unknown" => &["submitting"],
+        "failed" => &["preparing", "submitting", "failed"],
+        "unsupported" => &[
+            "saved",
+            "preparing",
+            "needs_review",
+            "ready",
+            "failed",
+            "unsupported",
+        ],
+        _ => &[],
+    }
+}
+
 pub async fn set_status(
     pool: &Db,
     id: Uuid,
     status: &str,
     detail: serde_json::Value,
 ) -> Result<Application, AppError> {
+    let from = allowed_from(status);
+    // The check and the write are one statement, so a concurrent change cannot slip between them.
     let row = sqlx::query_as::<_, Application>(
-        "update applications set status = $2, updated_at = now() where id = $1
+        "update applications set status = $2, updated_at = now() where id = $1 and status = any($3)
          returning id, opportunity_id, profile_id, status, route, route_reason, cv_document_id,
                    dossier_body, dossier_facts, notes, follow_up_at, created_at, updated_at",
     )
     .bind(id)
     .bind(status)
+    .bind(from)
     .fetch_optional(pool)
-    .await?
-    .ok_or(AppError::NotFound(id))?;
+    .await?;
+    let Some(row) = row else {
+        let current: Option<String> =
+            sqlx::query_scalar("select status from applications where id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        return Err(match current {
+            None => AppError::NotFound(id),
+            Some(current) => AppError::Invalid(format!(
+                "An application that is {current} cannot become {status}."
+            )),
+        });
+    };
     record_event(pool, id, &format!("status:{status}"), detail).await?;
     Ok(row)
+}
+
+/// Where a submission may be sent at all, before any policy or token: HTTPS to a named host with no
+/// credentials or explicit port, or loopback (the mock ATS). An IP literal anywhere else is how an
+/// employer-controlled URL would reach the VM's own network or the metadata server, so it never is.
+pub fn destination_is_safe(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let bare = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let ip = bare.parse::<std::net::IpAddr>().ok();
+    if bare == "localhost" || ip.is_some_and(|ip| ip.is_loopback()) {
+        return matches!(url.scheme(), "http" | "https");
+    }
+    url.scheme() == "https"
+        && url.port().is_none()
+        && ip.is_none()
+        && bare.contains('.')
+        && !bare.ends_with(".internal")
+        && !bare.ends_with(".local")
+}
+
+/// Statuses from which a new submission may start. Anything after an attempt (submitting, submitted,
+/// uncertain), anything the owner closed, and unsupported forms are refused before the browser opens.
+pub fn submittable(status: &str) -> bool {
+    allowed_from("submitting").contains(&status)
 }
 
 pub async fn update_tracking(
@@ -260,7 +335,8 @@ pub async fn update_tracking(
             "Wait for the active operation to finish before changing tracking.".into(),
         ));
     }
-    sqlx::query("update applications set status=$2, notes=$3, updated_at=now() where id=$1")
+    // The owner is tracking it by hand now, so automation lets go; queueing again is a separate act.
+    sqlx::query("update applications set status=$2, notes=$3, auto_resume=false, updated_at=now() where id=$1")
         .bind(id)
         .bind(status)
         .bind(notes)
@@ -621,6 +697,11 @@ pub async fn issue_token(
     payload_hash: &str,
     valid_for_minutes: i64,
 ) -> Result<Uuid, AppError> {
+    if !destination_is_safe(destination) {
+        return Err(AppError::Invalid(
+            "That destination is not an HTTPS employer address.".into(),
+        ));
+    }
     let owner_id = profiles::local_owner(pool).await?;
     let id: Uuid = sqlx::query_scalar(
         "insert into authorization_tokens (owner_id, application_id, payload_hash, destination, source_key, expires_at)
@@ -700,10 +781,14 @@ pub async fn decide_authorization(
     let profile_id = get_application(pool, application_id).await?.profile_id;
     let destination_matches: bool = sqlx::query_scalar("select exists(select 1 from postings p join sources s on s.id=p.source_id join applications a on a.opportunity_id=p.opportunity_id where a.id=$1 and p.url=$2 and s.key=$3 and p.closed_at is null)")
         .bind(application_id).bind(destination).bind(source_key).fetch_one(pool).await?;
+    // Every standing policy, with or without a profile, covers only an open posting of this
+    // application's own opportunity at exactly this URL from exactly this source. A policy without a
+    // profile used to skip that binding, which let it authorize any destination the caller named.
+    let bound = destination_matches && destination_is_safe(destination);
     let policy_rows: Vec<_> = list_policies(pool)
         .await?
         .into_iter()
-        .filter(|p| p.profile_id.is_none() || (p.profile_id == profile_id && destination_matches))
+        .filter(|p| bound && (p.profile_id.is_none() || p.profile_id == profile_id))
         .collect();
     // Counted per policy, so one policy's activity cannot exhaust another's daily allowance.
     let today: Vec<(Uuid, i64)> = sqlx::query_as(
@@ -897,6 +982,278 @@ pub async fn finish_attempt(
     .bind(evidence)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// What a finished attempt amounts to. The application status and the notification follow from it.
+pub struct Outcome<'a> {
+    /// `submitted`, `unknown` or `failed`.
+    pub attempt_state: &'a str,
+    pub receipt: Option<&'a str>,
+    pub diagnostic: Option<&'a str>,
+    pub evidence: serde_json::Value,
+}
+
+fn settled_as(attempt_state: &str) -> (&'static str, &'static str) {
+    match attempt_state {
+        "submitted" => ("submitted", "submitted"),
+        "failed" => ("failed", "failed"),
+        _ => ("submission_unknown", "submission_uncertain"),
+    }
+}
+
+/// Record a submission's outcome as one transaction: the attempt, the application status and the
+/// owner's notification. A crash leaves all of it or none of it, and `recover_interrupted` finishes
+/// the "none" case from the attempt row, so a receipt is never lost, never reported as unknown, and
+/// never followed by a second submission. The attempt is recorded even if the status cannot move.
+pub async fn finish_submission(
+    pool: &Db,
+    application_id: Uuid,
+    attempt_id: Uuid,
+    outcome: Outcome<'_>,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "update application_attempts set state = $3, receipt = $4, diagnostic = $5, evidence = $6, finished_at = now()
+         where id = $1 and application_id = $2",
+    )
+    .bind(attempt_id)
+    .bind(application_id)
+    .bind(outcome.attempt_state)
+    .bind(outcome.receipt)
+    .bind(outcome.diagnostic)
+    .bind(outcome.evidence)
+    .execute(&mut *tx)
+    .await?;
+    settle(
+        &mut tx,
+        application_id,
+        &attempt_id.to_string(),
+        outcome.attempt_state,
+        outcome.receipt,
+        outcome.diagnostic,
+        &["submitting"],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Status, event and deduplicated notification for an outcome, inside the caller's transaction.
+async fn settle(
+    tx: &mut sqlx::PgConnection,
+    application_id: Uuid,
+    reference: &str,
+    attempt_state: &str,
+    receipt: Option<&str>,
+    diagnostic: Option<&str>,
+    from: &[&str],
+) -> Result<(), AppError> {
+    let (status, kind) = settled_as(attempt_state);
+    let moved = sqlx::query("update applications set status = $2, updated_at = now() where id = $1 and status = any($3)")
+        .bind(application_id)
+        .bind(status)
+        .bind(from)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let mut detail = serde_json::json!({ "attempt": reference });
+    if let Some(receipt) = receipt {
+        detail["receipt"] = receipt.into();
+    }
+    if let Some(diagnostic) = diagnostic {
+        detail["diagnostic"] = diagnostic.into();
+    }
+    let event = if moved == 1 {
+        format!("status:{status}")
+    } else {
+        "outcome_recorded".to_owned()
+    };
+    sqlx::query(
+        "insert into application_events (application_id, kind, detail) values ($1, $2, $3)",
+    )
+    .bind(application_id)
+    .bind(event)
+    .bind(&detail)
+    .execute(&mut *tx)
+    .await?;
+    // The same key the live path has always used, so recovery after a commit adds nothing.
+    sqlx::query(
+        "insert into notifications (owner_id, application_id, kind, dedupe_key, payload)
+         select id, $1, $2, $3, $4 from owners order by created_at limit 1
+         on conflict (owner_id, dedupe_key) do nothing",
+    )
+    .bind(application_id)
+    .bind(kind)
+    .bind(format!("{kind}:{reference}"))
+    .bind(&detail)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// Finish what a crash interrupted, from the durable attempt rows. An attempt still started or filled
+/// after the worker's deadline is unknown and never retried; an application left submitting takes the
+/// outcome its attempt recorded (a receipt stays a receipt); a preparation that never began an attempt
+/// goes back to saved. Each change carries an event, and outcomes the notification the live path would
+/// have sent, under the same key, so repeated ticks and restarts neither lose nor repeat one.
+pub async fn recover_interrupted(pool: &Db) -> Result<(), AppError> {
+    const DIAGNOSTIC: &str = "Application interrupted; receipt must be checked with the employer.";
+    let stale: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "select id, application_id from application_attempts
+         where state in ('started','filled') and started_at < now() - interval '10 minutes'",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (attempt, application) in stale {
+        let mut tx = pool.begin().await?;
+        let claimed = sqlx::query("update application_attempts set state = 'unknown', diagnostic = $2, finished_at = now() where id = $1 and state in ('started','filled')")
+            .bind(attempt)
+            .bind(DIAGNOSTIC)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed == 1 {
+            let from = [
+                "submitting",
+                "saved",
+                "preparing",
+                "needs_review",
+                "ready",
+                "failed",
+            ];
+            settle(
+                &mut tx,
+                application,
+                &attempt.to_string(),
+                "unknown",
+                None,
+                Some(DIAGNOSTIC),
+                &from,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+    }
+    // Application, then its latest attempt: id, state, receipt, diagnostic.
+    type Interrupted = (
+        Uuid,
+        Option<Uuid>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let submitting: Vec<Interrupted> = sqlx::query_as(
+        "select a.id, t.id, t.state, t.receipt, t.diagnostic from applications a
+         left join lateral (select id, state, receipt, diagnostic from application_attempts
+                            where application_id = a.id order by started_at desc limit 1) t on true
+         where a.status = 'submitting' and a.updated_at < now() - interval '10 minutes'",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (application, attempt, state, receipt, diagnostic) in submitting {
+        let state = state
+            .filter(|s| matches!(s.as_str(), "submitted" | "failed"))
+            .unwrap_or_else(|| "unknown".into());
+        let reference =
+            attempt.map_or_else(|| format!("application-{application}"), |a| a.to_string());
+        let mut tx = pool.begin().await?;
+        let diagnostic = diagnostic.or_else(|| (state == "unknown").then(|| DIAGNOSTIC.to_owned()));
+        settle(
+            &mut tx,
+            application,
+            &reference,
+            &state,
+            receipt.as_deref(),
+            diagnostic.as_deref(),
+            &["submitting"],
+        )
+        .await?;
+        tx.commit().await?;
+    }
+    let reset: Vec<Uuid> = sqlx::query_scalar(
+        "update applications set status = 'saved', updated_at = now()
+         where status = 'preparing' and updated_at < now() - interval '10 minutes'
+           and not exists (select 1 from application_attempts t where t.application_id = applications.id and t.state in ('started','filled','submitted','unknown'))
+         returning id",
+    )
+    .fetch_all(pool)
+    .await?;
+    for id in reset {
+        record_event(
+            pool,
+            id,
+            "status:saved",
+            serde_json::json!({ "recovered": "preparation interrupted" }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The owner asking the queue to work on an application, recorded as an event. Allowed from saved,
+/// ready, needs_review and failed while no attempt has reached, or may have reached, the employer.
+/// Withdrawn, rejected, interview and unsupported are closed: the owner reopens one through tracking
+/// first, and queueing alone never puts it back into unattended automation.
+pub async fn queue_for_automation(pool: &Db, id: Uuid) -> Result<Application, AppError> {
+    let mut tx = pool.begin().await?;
+    let status: String =
+        sqlx::query_scalar("select status from applications where id = $1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AppError::NotFound(id))?;
+    let attempted: bool = sqlx::query_scalar(
+        "select exists(select 1 from application_attempts where application_id = $1 and state in ('started','filled','submitted','unknown'))",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    match status.as_str() {
+        // In hand or done: there is nothing to queue, and nothing is changed.
+        "preparing" | "submitting" | "submitted" | "submission_unknown" => {
+            tx.rollback().await?;
+            return get_application(pool, id).await;
+        }
+        "saved" | "ready" | "needs_review" | "failed" if !attempted => {}
+        "saved" | "ready" | "needs_review" | "failed" => return Err(AppError::Invalid(
+            "An earlier attempt may have reached the employer; resolve it before applying again."
+                .into(),
+        )),
+        other => {
+            return Err(AppError::Invalid(format!(
+                "This application is {other}. Reopen it first if you want to apply again."
+            )))
+        }
+    }
+    sqlx::query("update applications set status = 'saved', auto_resume = true, updated_at = now() where id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("insert into application_events (application_id, kind, detail) values ($1, 'owner_queued', $2)")
+        .bind(id)
+        .bind(serde_json::json!({ "from": status }))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    get_application(pool, id).await
+}
+
+/// After the owner answers its questions, an application the queue was already working on carries on.
+/// One the owner took out of automation, or one held for eligibility, stays where it is.
+pub async fn resume_after_answers(pool: &Db, id: Uuid) -> Result<(), AppError> {
+    let resumed = sqlx::query(
+        "update applications set status = 'saved', updated_at = now()
+         where id = $1 and auto_resume and status in ('needs_review','ready')
+           and not exists (select 1 from application_attempts t where t.application_id = $1 and t.state in ('started','filled','submitted','unknown'))",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if resumed == 1 {
+        record_event(pool, id, "answers_resumed", serde_json::json!({})).await?;
+    }
     Ok(())
 }
 

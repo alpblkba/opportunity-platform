@@ -98,7 +98,11 @@ pub(crate) async fn shortlist(
          where o.closed_at is null and (o.deadline_at is null or o.deadline_at > now())
            and ($1::text is null or o.search_vector @@ websearch_to_tsquery('simple', $1))
          group by o.id, org.display_name
-         order by o.last_seen_at desc, o.id
+         -- With a query, the cap keeps the strongest candidates rather than the newest: a query term in
+         -- the title first (which ranking scores highest), then full-text rank, then recency.
+         order by ($1::text is not null and to_tsvector('simple', o.canonical_title) @@ websearch_to_tsquery('simple', $1)) desc,
+                  case when $1::text is null then 0 else ts_rank(o.search_vector, websearch_to_tsquery('simple', $1)) end desc,
+                  o.last_seen_at desc, o.id
          limit $2",
     )
     .bind(query.q.as_deref().filter(|q| !q.trim().is_empty()))

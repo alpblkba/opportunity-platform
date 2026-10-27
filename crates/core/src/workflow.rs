@@ -303,6 +303,21 @@ async fn submit_holding_the_machine(
     source_key: &str,
     document_path: Option<String>,
 ) -> Result<SubmitReport, AppError> {
+    // Checked inside the browser slot, which serializes submissions, so the status cannot change
+    // between this check and the attempt row below.
+    if !applications::destination_is_safe(url) {
+        return Err(AppError::Invalid(
+            "That destination is not an HTTPS employer address.".into(),
+        ));
+    }
+    let status = applications::get_application(pool, application_id)
+        .await?
+        .status;
+    if !applications::submittable(&status) {
+        return Err(AppError::Invalid(format!(
+            "An application that is {status} cannot be submitted again; resolve it first."
+        )));
+    }
     let plan = worker::inspect(url)
         .await
         .map_err(|e| AppError::Invalid(worker_message(&e)))?;
@@ -364,6 +379,20 @@ async fn submit_holding_the_machine(
     };
     // Inside the browser slot, so two automatic submissions cannot both pass the daily cap.
     refuse_if_braked(pool, application_id, kind == "policy").await?;
+    // A standing policy is never broader than eligibility, whichever path the request came in by.
+    // A one-time token is the owner's explicit decision about this exact submission, and is not held.
+    if kind == "policy" {
+        if let Some(reason) = crate::product::policy_eligibility_hold(pool, application_id).await? {
+            applications::record_event(
+                pool,
+                application_id,
+                "submission_refused",
+                serde_json::json!({ "reason": reason }),
+            )
+            .await?;
+            return Err(AppError::Invalid(reason));
+        }
+    }
     let (attempt, newly) =
         applications::begin_attempt(pool, application_id, url, &hash, kind, policy_id, token_id)
             .await?;
@@ -407,226 +436,124 @@ async fn submit_holding_the_machine(
         progress_path: marker.display().to_string(),
     };
 
+    let report = |state: &str, receipt: Option<String>, diagnostic: Option<String>| SubmitReport {
+        application_id,
+        attempt_id: attempt.id,
+        permitted: true,
+        authorization: decision.reason().to_owned(),
+        state: state.into(),
+        receipt,
+        diagnostic,
+        newly_attempted: true,
+    };
+    let finish = |attempt_state: &'static str,
+                  receipt: Option<String>,
+                  diagnostic: Option<String>,
+                  evidence: serde_json::Value| {
+        let attempt_id = attempt.id;
+        async move {
+            applications::finish_submission(
+                pool,
+                application_id,
+                attempt_id,
+                applications::Outcome {
+                    attempt_state,
+                    receipt: receipt.as_deref(),
+                    diagnostic: diagnostic.as_deref(),
+                    evidence,
+                },
+            )
+            .await
+        }
+    };
+
     match worker::submit(&request).await {
         Ok(worker::SubmitOutcome::Submitted {
             receipt,
             screenshot,
         }) => {
-            applications::finish_attempt(
-                pool,
-                attempt.id,
+            finish(
                 "submitted",
-                Some(&receipt),
+                Some(receipt.clone()),
                 None,
                 serde_json::json!({ "screenshot": screenshot }),
             )
             .await?;
-            applications::set_status(
-                pool,
-                application_id,
-                "submitted",
-                serde_json::json!({ "receipt": receipt }),
-            )
-            .await?;
-            applications::notify(
-                pool,
-                Some(application_id),
-                "submitted",
-                &format!("submitted:{}", attempt.id),
-                serde_json::json!({ "receipt": receipt }),
-            )
-            .await?;
-            Ok(SubmitReport {
-                application_id,
-                attempt_id: attempt.id,
-                permitted: true,
-                authorization: decision.reason().to_owned(),
-                state: "submitted".into(),
-                receipt: Some(receipt),
-                diagnostic: None,
-                newly_attempted: true,
-            })
+            Ok(report("submitted", Some(receipt), None))
         }
+        // The decisive case. Nobody knows whether this landed, so it is recorded as unknown and the duplicate guard now blocks any further attempt until a human says what happened.
         Ok(worker::SubmitOutcome::Unknown {
             diagnostic,
             screenshot,
         }) => {
-            // The decisive case. Nobody knows whether this landed, so it is recorded as unknown and the duplicate guard now blocks any further attempt until a human says what happened.
-            applications::finish_attempt(
-                pool,
-                attempt.id,
+            finish(
                 "unknown",
                 None,
-                Some(&diagnostic),
+                Some(diagnostic.clone()),
                 serde_json::json!({ "screenshot": screenshot }),
             )
             .await?;
-            applications::set_status(
-                pool,
-                application_id,
-                "submission_unknown",
-                serde_json::json!({ "diagnostic": diagnostic }),
-            )
-            .await?;
-            applications::notify(
-                pool,
-                Some(application_id),
-                "submission_uncertain",
-                &format!("submission_uncertain:{}", attempt.id),
-                serde_json::json!({ "diagnostic": diagnostic }),
-            )
-            .await?;
-            Ok(SubmitReport {
-                application_id,
-                attempt_id: attempt.id,
-                permitted: true,
-                authorization: decision.reason().to_owned(),
-                state: "submission_unknown".into(),
-                receipt: None,
-                diagnostic: Some(diagnostic),
-                newly_attempted: true,
-            })
+            Ok(report("submission_unknown", None, Some(diagnostic)))
         }
-        // The worker reported a failure itself, which means it was alive to establish that nothing was sent.
-        Ok(worker::SubmitOutcome::Failed { diagnostic }) => {
-            // A failure is the one outcome that leaves the application submittable again, because nothing was sent.
-            applications::finish_attempt(
-                pool,
-                attempt.id,
-                "failed",
+        // The worker only reports failure before it clicks; a failure after the click marker contradicts
+        // that, and the conservative reading of a contradiction is "nobody knows".
+        Ok(worker::SubmitOutcome::Failed { diagnostic }) if marker.exists() => {
+            let diagnostic = format!("the worker reported a failure after the submit click, so whether it was recorded is unknown: {diagnostic}");
+            finish(
+                "unknown",
                 None,
-                Some(&diagnostic),
+                Some(diagnostic.clone()),
                 serde_json::json!({}),
             )
             .await?;
-            applications::set_status(
-                pool,
-                application_id,
+            Ok(report("submission_unknown", None, Some(diagnostic)))
+        }
+        // The worker reported a failure itself, which means it was alive to establish that nothing was
+        // sent: the one outcome that leaves the application submittable again.
+        Ok(worker::SubmitOutcome::Failed { diagnostic }) => {
+            finish(
                 "failed",
-                serde_json::json!({ "diagnostic": diagnostic }),
+                None,
+                Some(diagnostic.clone()),
+                serde_json::json!({}),
             )
             .await?;
-            applications::notify(
-                pool,
-                Some(application_id),
-                "failed",
-                &format!("failed:{}", attempt.id),
-                serde_json::json!({ "diagnostic": diagnostic }),
-            )
-            .await?;
-            Ok(SubmitReport {
-                application_id,
-                attempt_id: attempt.id,
-                permitted: true,
-                authorization: decision.reason().to_owned(),
-                state: "failed".into(),
-                receipt: None,
-                diagnostic: Some(diagnostic),
-                newly_attempted: true,
-            })
+            Ok(report("failed", None, Some(diagnostic)))
         }
         // The worker did not report anything: it crashed, or the kernel killed it. Whether that is safe to retry depends entirely on whether it had already clicked, which is what the marker file records.
         Err(error) => {
-            let died_after_clicking = marker.exists();
-            let diagnostic = if died_after_clicking {
-                format!(
+            if marker.exists() {
+                let diagnostic = format!(
                     "the browser died during or after the submission, so whether it was recorded is unknown: {}",
                     worker_message(&error)
-                )
-            } else {
-                format!(
-                    "the run ended before anything was submitted, so nothing was sent: {}",
-                    worker_message(&error)
-                )
-            };
-            if died_after_clicking {
-                record_uncertain_outcome(pool, application_id, attempt.id, &diagnostic).await?;
-                Ok(SubmitReport {
-                    application_id,
-                    attempt_id: attempt.id,
-                    permitted: true,
-                    authorization: decision.reason().to_owned(),
-                    state: "submission_unknown".into(),
-                    receipt: None,
-                    diagnostic: Some(diagnostic),
-                    newly_attempted: true,
-                })
-            } else {
-                applications::finish_attempt(
-                    pool,
-                    attempt.id,
-                    "failed",
+                );
+                finish(
+                    "unknown",
                     None,
-                    Some(&diagnostic),
+                    Some(diagnostic.clone()),
                     serde_json::json!({}),
                 )
                 .await?;
-                applications::set_status(
-                    pool,
-                    application_id,
-                    "failed",
-                    serde_json::json!({ "diagnostic": diagnostic }),
-                )
-                .await?;
-                applications::notify(
-                    pool,
-                    Some(application_id),
-                    "failed",
-                    &format!("failed:{}", attempt.id),
-                    serde_json::json!({ "diagnostic": diagnostic }),
-                )
-                .await?;
-                match error {
-                    // A deployment without a browser is not a failed attempt to use one; it is an answer about this deployment, and it reads better as one.
-                    worker::WorkerError::Unavailable(message) => Err(AppError::Invalid(message)),
-                    _ => Ok(SubmitReport {
-                        application_id,
-                        attempt_id: attempt.id,
-                        permitted: true,
-                        authorization: decision.reason().to_owned(),
-                        state: "failed".into(),
-                        receipt: None,
-                        diagnostic: Some(diagnostic),
-                        newly_attempted: true,
-                    }),
-                }
+                return Ok(report("submission_unknown", None, Some(diagnostic)));
+            }
+            let diagnostic = format!(
+                "the run ended before anything was submitted, so nothing was sent: {}",
+                worker_message(&error)
+            );
+            finish(
+                "failed",
+                None,
+                Some(diagnostic.clone()),
+                serde_json::json!({}),
+            )
+            .await?;
+            match error {
+                // A deployment without a browser is not a failed attempt to use one; it is an answer about this deployment, and it reads better as one.
+                worker::WorkerError::Unavailable(message) => Err(AppError::Invalid(message)),
+                _ => Ok(report("failed", None, Some(diagnostic))),
             }
         }
     }
-}
-
-/// Record an outcome nobody can verify. The attempt stays `unknown`, which the duplicate guard treats as final until a person reconciles it, and the owner is told.
-async fn record_uncertain_outcome(
-    pool: &Db,
-    application_id: Uuid,
-    attempt_id: Uuid,
-    diagnostic: &str,
-) -> Result<(), AppError> {
-    applications::finish_attempt(
-        pool,
-        attempt_id,
-        "unknown",
-        None,
-        Some(diagnostic),
-        serde_json::json!({}),
-    )
-    .await?;
-    applications::set_status(
-        pool,
-        application_id,
-        "submission_unknown",
-        serde_json::json!({ "diagnostic": diagnostic }),
-    )
-    .await?;
-    applications::notify(
-        pool,
-        Some(application_id),
-        "submission_uncertain",
-        &format!("submission_uncertain:{attempt_id}"),
-        serde_json::json!({ "diagnostic": diagnostic }),
-    )
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]

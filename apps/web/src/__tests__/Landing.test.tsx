@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
 
-const home = { cv: null, cv_ready: false, profiles: [{ id: "memory", name: "Memory and operating systems" }], selected_profile: "memory", jobs: [], matches: 0, discovered: 0, applications: [], questions: [], policies: [], mail: [], email_configured: false, last_updated: null };
+const home = { cv: null, cv_ready: false, profiles: [{ id: "memory", name: "Memory and operating systems" }], selected_profile: "memory", jobs: [], matches: 0, discovered: 0, applications: [], source_health:{enabled:3,failing:0,never_succeeded:0,stale:0,last_success_at:null},application_counts:{confirmed:0, reported:0, uncertain:0, failed:0, needs_review:0, queued:0, manual:0}, questions: [], policies: [], mail: [], email_configured: false, last_updated: null };
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 /** A server that answers the session check with `session` (null = nobody), and serves the workspace. */

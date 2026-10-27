@@ -68,6 +68,6 @@ async fn answer(
     Json(b): Json<AnswerBody>,
 ) -> Result<Json<Value>, ApiError> {
     let task = applications::answer_review_task(&s.db, id, &b.answer).await?;
-    sqlx::query("update applications set status='saved',auto_resume=true,updated_at=now() where id=$1 and status in ('needs_review','ready')").bind(task.application_id).execute(&s.db).await?;
+    applications::resume_after_answers(&s.db, task.application_id).await?;
     Ok(Json(json!({"ok":true})))
 }

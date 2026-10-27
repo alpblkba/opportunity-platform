@@ -26,7 +26,7 @@ pub async fn dispatch(db: &Db) -> anyhow::Result<()> {
     sqlx::query("update notifications set delivery_state='failed',delivery_error='Delivery could not be confirmed; automatic retry stopped to prevent duplicate email.' where delivery_receipt is null and first_attempt_at<now()-interval '23 hours' and delivered_at is null")
         .execute(db).await?;
     let mut tx = db.begin().await?;
-    let rows:Vec<(Uuid,String,Value,Option<String>)>=sqlx::query_as("select n.id,n.kind,jsonb_build_object('employer',org.display_name,'position',o.canonical_title,'url',(select p.url from postings p where p.opportunity_id=o.id order by p.url limit 1),'time',n.created_at,'detail',n.payload),n.delivery_receipt from notifications n join applications a on a.id=n.application_id join opportunities o on o.id=a.opportunity_id join organizations org on org.id=o.organization_id where n.kind in ('submitted','action_required','submission_uncertain','failed','manual_required') and n.delivered_at is null and n.delivery_state not in ('bounced','failed') and (n.last_attempt_at is null or n.last_attempt_at<now()-interval '1 minute') order by n.created_at for update of n skip locked limit 5").fetch_all(&mut *tx).await?;
+    let rows:Vec<(Uuid,String,Value,Option<String>)>=sqlx::query_as("select n.id,n.kind,jsonb_build_object('employer',coalesce(org.display_name,n.payload->>'source'),'position',coalesce(o.canonical_title,'career site'),'url',coalesce((select p.url from postings p where p.opportunity_id=o.id order by p.url limit 1),''),'time',n.created_at,'detail',n.payload),n.delivery_receipt from notifications n left join applications a on a.id=n.application_id left join opportunities o on o.id=a.opportunity_id left join organizations org on org.id=o.organization_id where n.kind in ('submitted','action_required','submission_uncertain','failed','manual_required','source_failing') and n.delivered_at is null and n.delivery_state not in ('bounced','failed') and (n.last_attempt_at is null or n.last_attempt_at<now()-interval '1 minute') order by n.created_at for update of n skip locked limit 5").fetch_all(&mut *tx).await?;
     // Persist the attempt before network I/O: a process crash must not reset the retry window.
     for (id, _, _, _) in &rows {
         sqlx::query("update notifications set first_attempt_at=coalesce(first_attempt_at,now()),last_attempt_at=now() where id=$1")
@@ -74,6 +74,7 @@ fn wording(kind: &str) -> (&'static str, &'static str) {
         "submission_uncertain" => ("Check with the employer", "The form may have been sent, but no confirmation was seen. It will not be retried; check with the employer before applying again."),
         "failed" => ("Application failed", "Nothing was confirmed as sent. Open Opportunities to retry it."),
         "manual_required" => ("Complete on the employer website", "Automation cannot finish this form. Open Opportunities for the employer link."),
+        "source_failing" => ("Source not refreshing", "Its listings are kept, not closed, while it fails. Check whether the employer moved its career site."),
         _ => ("Your answer is needed", "Open Opportunities to answer the employer's questions."),
     }
 }
@@ -88,10 +89,11 @@ mod tests {
             "submission_uncertain",
             "failed",
             "manual_required",
+            "source_failing",
         ]
         .iter()
         .map(|k| super::wording(k).0)
         .collect();
-        assert_eq!(subjects.len(), 5);
+        assert_eq!(subjects.len(), 6);
     }
 }

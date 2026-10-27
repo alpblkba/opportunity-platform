@@ -52,7 +52,9 @@ COPY --from=web /build/apps/web/dist /app/apps/web/dist
 COPY config /app/config
 RUN mkdir -p /app/private && chown -R opportunity:opportunity /app/private
 USER opportunity
-ENV WEB_DIST=/app/apps/web/dist \
+# The image's revision label is the deployed identity; the process reports the same value in /api/ops/status.
+ENV APP_REVISION=$GIT_REVISION \
+    WEB_DIST=/app/apps/web/dist \
     RAW_SNAPSHOT_DIR=/app/private/cache \
     API_HOST=0.0.0.0 \
     API_PORT=8787

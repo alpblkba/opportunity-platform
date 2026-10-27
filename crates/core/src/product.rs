@@ -24,7 +24,8 @@ pub const TRACKS: &[(&str, &str)] = &[
 
 pub async fn initialize(db: &Db) -> anyhow::Result<()> {
     profiles::seed_default_profiles(db).await?;
-    crate::config::import_sources(db, include_str!("../../../config/sources.seed.toml")).await?;
+    crate::config::import_release_seed(db, include_str!("../../../config/sources.seed.toml"))
+        .await?;
     Ok(())
 }
 
@@ -65,7 +66,7 @@ pub async fn select(db: &Db, id: Uuid) -> Result<(), AppError> {
 }
 
 /// Names the ranking rules in API output, so a score can be traced to the policy that produced it.
-pub const RANKING_POLICY: &str = "career-priority-v2";
+pub const RANKING_POLICY: &str = "career-priority-v3";
 
 #[derive(Debug, Serialize)]
 pub struct RankedJob {
@@ -173,20 +174,37 @@ fn effective_kind(job: &matching::ScoredRow) -> &str {
 
 fn career_stage(job: &matching::ScoredRow) -> CareerStage {
     use CareerStage::*;
-    match effective_kind(job) {
-        "master_thesis" => return Thesis,
-        "internship" => return Internship,
-        "working_student" => return WorkingStudent,
-        "research_assistant" => return ResearchAssistant,
-        "phd" => return Phd,
-        _ => {}
-    }
     let title = opportunity_domain::normalize_location(Some(&job.canonical_title));
     let has = |words: &[&str]| {
         words
             .iter()
             .any(|w| opportunity_domain::normalize::contains_phrase(&title, w))
     };
+    let kind = effective_kind(job);
+    // A kind read back from the title ("Senior Manager, Internship Programs") loses to seniority in
+    // that same title; a kind the source itself reported is trusted.
+    let from_title = kind != job.kind;
+    if !(from_title
+        && has(&[
+            "senior",
+            "sr",
+            "lead",
+            "manager",
+            "staff",
+            "principal",
+            "director",
+            "head of",
+        ]))
+    {
+        match kind {
+            "master_thesis" => return Thesis,
+            "internship" => return Internship,
+            "working_student" => return WorkingStudent,
+            "research_assistant" => return ResearchAssistant,
+            "phd" => return Phd,
+            _ => {}
+        }
+    }
     // German academic employment ("wissenschaftliche/r Mitarbeiter/in") is in practice a doctoral post.
     if title.contains("wissenschaftlich") && title.contains("mitarbeiter") {
         return Phd;
@@ -237,7 +255,7 @@ fn career_stage(job: &matching::ScoredRow) -> CareerStage {
         return Junior;
     }
     // A plain "Software Engineer" is not assumed junior; a stated requirement only downranks.
-    match required_years(job.description_text.as_deref().unwrap_or("")) {
+    match years_mentioned(job.description_text.as_deref().unwrap_or("")) {
         Some(years) if years >= 8 => Senior,
         Some(years) if years >= 5 => Mid,
         _ => Unspecified,
@@ -247,6 +265,37 @@ fn career_stage(job: &matching::ScoredRow) -> CareerStage {
 fn priority_score(technical: f32, profile: f32, stage: f32, profile_key: &str) -> f32 {
     let (t, p, s) = weights(profile_key);
     (t * technical.clamp(0.0, 100.0) + p * profile.clamp(0.0, 100.0) + s * stage).clamp(0.0, 100.0)
+}
+
+/// Why a standing policy may not submit this application right now, or `None` when its opportunity is
+/// auto-eligible for the application's profile at this moment. Called before any policy-authorized
+/// attempt, from the queue and from the direct submit endpoint alike.
+pub async fn policy_eligibility_hold(
+    db: &Db,
+    application_id: Uuid,
+) -> Result<Option<String>, AppError> {
+    let app = applications::get_application(db, application_id).await?;
+    let settled = match app.profile_id {
+        Some(profile) => ranked(db, profile)
+            .await?
+            .into_iter()
+            .find(|j| j.job.id == app.opportunity_id)
+            .map(|j| (j.auto_eligible, j.gaps)),
+        None => None,
+    };
+    Ok(eligibility_hold(settled))
+}
+
+/// Why an automatic submission must wait for the owner, given the opportunity's current ranking for
+/// the application's profile (auto-eligible, gaps). Not ranked at all is not eligible either.
+fn eligibility_hold(settled: Option<(bool, Vec<String>)>) -> Option<String> {
+    match settled {
+        Some((true, _)) => None,
+        Some((false, gaps)) if !gaps.is_empty() => {
+            Some(format!("Review before applying: {}.", gaps.join("; ")))
+        }
+        _ => Some("Review before applying: eligibility for this profile is not settled.".into()),
+    }
 }
 
 /// Neither stage priority nor a profile score grants permission to submit; the per-employer
@@ -271,13 +320,16 @@ fn direction(key: &str) -> Vec<&'static str> {
             "bootloader",
             "device driver",
             "platform systems",
+            "microcontroller",
+            "BSP",
         ],
         "memory" => vec![
             "memory",
             "DRAM",
             "CXL",
             "DDR",
-            "kernel",
+            // Not bare "kernel": a CUDA or compute kernel is not an operating-system kernel.
+            "linux kernel",
             "operating systems",
             "Linux",
             "storage",
@@ -288,6 +340,10 @@ fn direction(key: &str) -> Vec<&'static str> {
             "microarchitecture",
             "RISC-V",
             "Verilog",
+            "SystemVerilog",
+            "VHDL",
+            "FPGA",
+            "SoC",
             "verification",
             "ASIC",
             "architecture",
@@ -359,13 +415,15 @@ fn fit(
     ]
     .iter()
     .any(|w| candidate::mentions(&title, w));
-    let years = required_years(description);
-    if let Some(required) = years {
-        if cv.experience_years.unwrap_or(0) < required {
-            gaps.push(format!(
-                "{required}+ years requested; not established by your CV"
-            ));
-        }
+    // A required number of years is always for review: the CV's years are not attributed to a field,
+    // and telecom or general employment is not years of RTL or CPU design (DECISIONS 5).
+    if let Some(required) = required_years(description) {
+        gaps.push(match cv.experience_years {
+            Some(claimed) if claimed >= required => format!(
+                "{required}+ years required; your CV's {claimed} years are not established in this field"
+            ),
+            _ => format!("{required}+ years required; not established by your CV"),
+        });
     } else if senior && cv.experience_years.unwrap_or(0) < 5 {
         gaps.push("Senior experience is not established by your CV".into());
     }
@@ -436,21 +494,49 @@ fn fit(
     )
 }
 
+/// The largest "N years" a posting asks for, in any sentence. Used only to place an untitled role.
+fn years_mentioned(text: &str) -> Option<i32> {
+    years_by_sentence(text).map(|(n, _)| n).max()
+}
+
+/// The largest "N years" stated as a requirement. A sentence that says preferred, a plus, nice to
+/// have or ideally is a wish, not a condition; anything else is read as required.
 fn required_years(text: &str) -> Option<i32> {
-    let lower = text.to_lowercase();
-    let words: Vec<&str> = lower.split_whitespace().collect();
-    words
-        .windows(2)
-        .filter_map(|w| {
-            if !w[1].starts_with("year") {
-                return None;
-            }
-            w[0].trim_matches(|c: char| !c.is_ascii_digit())
-                .parse::<i32>()
-                .ok()
-                .filter(|n| (1..=30).contains(n))
-        })
+    years_by_sentence(text)
+        .filter(|(_, preferred)| !preferred)
+        .map(|(n, _)| n)
         .max()
+}
+
+fn years_by_sentence(text: &str) -> impl Iterator<Item = (i32, bool)> + '_ {
+    const PREFERRED: [&str; 8] = [
+        "preferred",
+        "a plus",
+        "nice to have",
+        "ideally",
+        "desirable",
+        "bonus",
+        "advantage",
+        "wünschenswert",
+    ];
+    text.split(['.', ';', '\n', '•']).flat_map(|sentence| {
+        let lower = sentence.to_lowercase();
+        let preferred = PREFERRED.iter().any(|p| lower.contains(p));
+        let words: Vec<String> = lower.split_whitespace().map(str::to_owned).collect();
+        words
+            .windows(2)
+            .filter_map(|w| {
+                if !(w[1].starts_with("year") || w[1].starts_with("jahr")) {
+                    return None;
+                }
+                w[0].trim_matches(|c: char| !c.is_ascii_digit())
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|n| (1..=30).contains(n))
+            })
+            .map(|n| (n, preferred))
+            .collect::<Vec<_>>()
+    })
 }
 
 pub async fn ranked(db: &Db, profile_id: Uuid) -> Result<Vec<RankedJob>, AppError> {
@@ -575,11 +661,33 @@ pub async fn dashboard(db: &Db) -> Result<Value, AppError> {
             .fetch_one(db)
             .await?;
     let questions = applications::list_review_tasks(db, None).await?;
+    let counts = application_counts(db).await?;
+    let source_health = crate::ops::source_health(db).await?;
     let (paused, cap) = workflow::brakes(db).await?;
     let mail:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('application_id',application_id,'state',delivery_state,'error',delivery_error) from notifications where kind='submitted' order by created_at desc limit 100").fetch_all(db).await?;
     Ok(
-        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some(),"ranking_policy":RANKING_POLICY,"submissions_paused":paused,"max_automatic_per_day":cap}),
+        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"application_counts":counts,"source_health":source_health,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some(),"ranking_policy":RANKING_POLICY,"submissions_paused":paused,"max_automatic_per_day":cap}),
     )
+}
+
+/// Counts over every application, not the page of recent ones the dashboard lists. "Confirmed" has an
+/// attempt with an employer receipt; "reported" is one the owner marked sent; an uncertain or failed
+/// attempt is neither, and neither is ever counted as applied.
+pub async fn application_counts(db: &Db) -> Result<Value, AppError> {
+    Ok(sqlx::query_scalar(
+        "select jsonb_build_object(
+           'confirmed', count(*) filter (where submitted),
+           'reported', count(*) filter (where not submitted and a.status in ('submitted','interview','rejected')),
+           'uncertain', count(*) filter (where a.status = 'submission_unknown'),
+           'failed', count(*) filter (where a.status = 'failed'),
+           'needs_review', count(*) filter (where a.status = 'needs_review'),
+           'queued', count(*) filter (where a.auto_resume and a.status in ('saved','preparing','ready','submitting')),
+           'manual', count(*) filter (where a.status = 'unsupported'))
+         from applications a
+         cross join lateral (select exists(select 1 from application_attempts t where t.application_id = a.id and t.state = 'submitted') as submitted) s",
+    )
+    .fetch_one(db)
+    .await?)
 }
 
 /// The owner's emergency stop: refuses every submission and halts automatic preparation.
@@ -621,17 +729,8 @@ pub async fn enqueue(db: &Db, opportunity_id: Uuid) -> Result<Uuid, AppError> {
     }
     let app =
         applications::create_application(db, opportunity_id, Some(selection(db).await?)).await?;
-    if ["submitted", "submission_unknown", "submitting", "preparing"].contains(&app.status.as_str())
-    {
-        return Ok(app.id);
-    }
-    sqlx::query(
-        "update applications set status='saved',auto_resume=true,updated_at=now() where id=$1",
-    )
-    .bind(app.id)
-    .execute(db)
-    .await?;
-    Ok(app.id)
+    // The owner's explicit queueing, with its own rules: closed applications are reopened first.
+    Ok(applications::queue_for_automation(db, app.id).await?.id)
 }
 
 /// Hand an application to the owner: no automation will touch it again, so they are told once.
@@ -711,6 +810,25 @@ pub async fn process_application(db: &Db, id: Uuid) -> Result<(), AppError> {
     let permitted:bool=sqlx::query_scalar("select exists(select 1 from authorization_policies where enabled and revoked_at is null and expires_at>now() and profile_id=$1 and $2=any(source_keys))")
         .bind(app.profile_id).bind(&key).fetch_one(db).await?;
     if permitted {
+        // Queueing is not proof of eligibility and ranking never authorizes: the automatic path is
+        // stricter than discovery, so anything not settled as eligible right now goes to the owner.
+        if let Some(reason) = policy_eligibility_hold(db, id).await? {
+            applications::set_status(db, id, "needs_review", json!({ "reason": reason })).await?;
+            sqlx::query("update applications set auto_resume=false, route_reason=$2 where id=$1")
+                .bind(id)
+                .bind(&reason)
+                .execute(db)
+                .await?;
+            applications::notify(
+                db,
+                Some(id),
+                "action_required",
+                &format!("eligibility:{id}"),
+                json!({ "reason": reason }),
+            )
+            .await?;
+            return Ok(());
+        }
         if let Err(error) = workflow::submit(db, id, &url, &key, Some(path)).await {
             // Quotas or revoked authorization leave it ready; no submission is claimed.
             sqlx::query("update applications set route_reason=$2 where id=$1")
@@ -733,9 +851,7 @@ pub async fn tick(db: &Db) -> Result<(), AppError> {
         return Ok(());
     }
     // Worker operations have a two-minute deadline. A stale claim after a crash is never resubmitted.
-    sqlx::query("update application_attempts set state='unknown',diagnostic='Application interrupted; receipt must be checked with the employer.',finished_at=now() where state in ('started','filled') and started_at<now()-interval '10 minutes'").execute(db).await?;
-    sqlx::query("update applications set status='submission_unknown',updated_at=now() where status='submitting' and updated_at<now()-interval '10 minutes'").execute(db).await?;
-    sqlx::query("update applications set status='saved',updated_at=now() where status='preparing' and updated_at<now()-interval '10 minutes' and not exists(select 1 from application_attempts t where t.application_id=applications.id and t.state in ('started','submitted','unknown'))").execute(db).await?;
+    applications::recover_interrupted(db).await?;
     if workflow::brakes(db).await?.0 {
         lock.commit().await?;
         return Ok(());
@@ -761,11 +877,53 @@ pub async fn tick(db: &Db) -> Result<(), AppError> {
             }
         }
     }
-    let queued:Vec<Uuid>=sqlx::query_scalar("select id from applications where auto_resume and (status='saved' or (status='ready' and updated_at<now()-interval '10 minutes')) order by updated_at limit 2").fetch_all(db).await?;
+    let queued:Vec<Uuid>=sqlx::query_scalar("select id from applications a where auto_resume and (status='saved' or (status='ready' and updated_at<now()-interval '10 minutes')) and not exists(select 1 from application_attempts t where t.application_id=a.id and t.state in ('started','filled','submitted','unknown')) order by updated_at limit 2").fetch_all(db).await?;
     for id in queued {
         process_application(db, id).await?;
     }
     lock.commit().await?;
+    Ok(())
+}
+
+/// Failures this many in a row, after the scheduler's own backoff, mean the source needs the owner.
+const SOURCE_ALERT_FAILURES: i32 = 3;
+/// Reminder points, in days since the outage began; after the last one, one reminder a month.
+const SOURCE_ALERT_REMINDER_DAYS: [i64; 5] = [1, 3, 7, 14, 30];
+
+/// Which alert of an outage `days` old is due: 0 is the first, then one per reminder point passed,
+/// then one per further month, so an outage that never ends is never silenced for good.
+fn source_alert_stage(days: i64) -> i64 {
+    let passed = SOURCE_ALERT_REMINDER_DAYS
+        .iter()
+        .filter(|d| days >= **d)
+        .count() as i64;
+    passed + (days - 30).max(0) / 30
+}
+
+/// Alerts for enabled sources that keep failing after the scheduler's own retries: one when the
+/// outage is noticed, reminders on a widening schedule, and a fresh alert for a new outage after a
+/// recovery. Deduplicated by key, so repeated ticks and restarts add nothing.
+pub async fn alert_failing_sources(db: &Db) -> Result<(), AppError> {
+    let failing: Vec<(Uuid, String, i32, DateTime<Utc>, bool)> = sqlx::query_as(
+        "select id, display_name, consecutive_failures, coalesce(last_success_at, created_at), last_success_at is null
+         from sources where enabled and consecutive_failures >= $1",
+    )
+    .bind(SOURCE_ALERT_FAILURES)
+    .fetch_all(db)
+    .await?;
+    for (id, name, failures, since, never_succeeded) in failing {
+        let stage = source_alert_stage((Utc::now() - since).num_days());
+        // The outage is identified by the success it follows; its age only picks the reminder.
+        let outage = if never_succeeded {
+            "never".to_owned()
+        } else {
+            since.timestamp().to_string()
+        };
+        let key = format!("source-failing:{id}:{outage}:{stage}");
+        let payload = json!({"source": name, "failures": failures, "failing_since": since,
+                             "never_succeeded": never_succeeded, "reminder": stage > 0});
+        applications::notify(db, None, "source_failing", &key, payload).await?;
+    }
     Ok(())
 }
 
@@ -774,6 +932,9 @@ pub fn spawn(db: Db) {
         loop {
             if let Err(error) = tick(&db).await {
                 tracing::warn!(%error,"application queue");
+            }
+            if let Err(error) = alert_failing_sources(&db).await {
+                tracing::warn!(%error, "source alerts");
             }
             if let Err(error) = crate::mail::dispatch(&db).await {
                 tracing::warn!(%error,"email delivery");
@@ -790,6 +951,60 @@ mod tests {
     fn requirements_are_not_cv_qualifications() {
         assert_eq!(required_years("Requires 7+ years of experience"), Some(7));
         assert_eq!(required_years("Our company was founded in 2001"), None);
+    }
+
+    #[test]
+    fn preferred_years_are_a_wish_and_required_years_are_never_settled_by_general_experience() {
+        assert_eq!(
+            required_years("3+ years of RTL experience required."),
+            Some(3)
+        );
+        assert_eq!(
+            required_years("Mindestens 3 Jahre Berufserfahrung."),
+            Some(3)
+        );
+        assert_eq!(
+            required_years("3+ years of experience preferred. Python is a plus."),
+            None
+        );
+        assert_eq!(
+            required_years("Ideally 5 years in verification; a degree in EE."),
+            None
+        );
+        assert_eq!(
+            required_years("2 years required. 6 years nice to have."),
+            Some(2)
+        );
+        assert_eq!(years_mentioned("5+ years preferred"), Some(5));
+
+        let cv = CandidateProfile {
+            skills: vec!["SystemVerilog".into(), "RISC-V".into(), "Linux".into()],
+            experience_years: Some(6),
+            ..Default::default()
+        };
+        let required = row(
+            "RTL Design Engineer",
+            "employment",
+            "RTL design in SystemVerilog for RISC-V cores. 3+ years of RTL experience required.",
+        );
+        let (_, _, gaps, automatic) = fit(&cv, "architecture", &required);
+        assert!(
+            gaps.iter()
+                .any(|g| g.contains("3+ years required")
+                    && g.contains("not established in this field")),
+            "{gaps:?}"
+        );
+        assert!(
+            !automatic,
+            "general years never make a years requirement automatic"
+        );
+        let preferred = row(
+            "RTL Design Engineer",
+            "employment",
+            "RTL design in SystemVerilog for RISC-V cores. 3+ years of RTL experience preferred.",
+        );
+        let (_, _, gaps, _) = fit(&cv, "architecture", &preferred);
+        assert!(!gaps.iter().any(|g| g.contains("years")), "{gaps:?}");
     }
 
     use opportunity_domain::{ExclusionKind, ExclusionRule, Profile};
@@ -820,6 +1035,68 @@ mod tests {
         let mut candidate = matching::to_candidate(job);
         candidate.kind = effective_kind(job).to_owned();
         opportunity_domain::evaluate(profile, &candidate, rules, None).eligible
+    }
+
+    #[test]
+    fn requested_title_variants_classify_without_false_positives() {
+        use CareerStage::*;
+        let cases: &[(&str, &str, CareerStage)] = &[
+            ("Firmware Internship", "employment", Internship),
+            ("Intern, CPU Verification", "employment", Internship),
+            ("Master's Thesis: Memory Controllers", "employment", Thesis),
+            ("Masterarbeit Speichersysteme", "employment", Thesis),
+            ("Abschlussarbeit im Bereich RISC-V", "employment", Thesis),
+            (
+                "Werkstudent Embedded Software",
+                "employment",
+                WorkingStudent,
+            ),
+            ("Working Student Firmware", "employment", WorkingStudent),
+            (
+                "Research Assistant, Computer Architecture",
+                "employment",
+                ResearchAssistant,
+            ),
+            ("Graduate Engineer, ASIC", "employment", NewGrad),
+            ("New Graduate Firmware Engineer", "employment", NewGrad),
+            ("Early Career Hardware Engineer", "employment", NewGrad),
+            ("Junior Embedded Engineer", "employment", Junior),
+            ("Associate Engineer, Validation", "employment", Junior),
+            ("Firmware Engineer I", "employment", Junior),
+            ("Firmware Engineer II", "employment", Mid),
+            ("Mid-Level RTL Engineer", "employment", Mid),
+            ("Senior Firmware Engineer", "employment", Senior),
+            ("Staff CPU Architect", "employment", Staff),
+            ("Principal Engineer, Memory", "employment", Staff),
+            (
+                "Research Engineer, AI Accelerators",
+                "employment",
+                Unspecified,
+            ),
+            ("PhD Candidate in Computer Architecture", "employment", Phd),
+            ("Doctoral Researcher, Operating Systems", "employment", Phd),
+            (
+                "Wissenschaftlicher Mitarbeiter (m/w/d) Rechnerarchitektur",
+                "employment",
+                Phd,
+            ),
+            ("Internal Tools Engineer", "employment", Unspecified),
+            ("Senior Manager, Internship Programs", "employment", Senior),
+            ("Firmware Engineer", "employment", Unspecified),
+            ("Graduate Program Manager", "employment", Senior),
+        ];
+        let mut wrong = vec![];
+        for (title, kind, want) in cases {
+            let got = career_stage(&row(
+                title,
+                kind,
+                "Mentor interns and work with senior engineers.",
+            ));
+            if got != *want {
+                wrong.push(format!("{title}: got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
     }
 
     #[test]
@@ -1016,5 +1293,25 @@ mod tests {
             &fit,
             "potential_supervisor"
         ));
+    }
+
+    #[test]
+    fn source_alert_reminders_widen_and_never_stop() {
+        let stages: Vec<i64> = [0, 1, 2, 3, 6, 7, 14, 29, 30, 59, 60, 400]
+            .iter()
+            .map(|d| source_alert_stage(*d))
+            .collect();
+        assert_eq!(stages, [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 17]);
+    }
+
+    #[test]
+    fn automatic_submission_waits_for_the_owner_unless_eligibility_is_settled() {
+        assert_eq!(eligibility_hold(Some((true, vec![]))), None);
+        let gaps =
+            eligibility_hold(Some((false, vec!["posting asks for 3+ years".into()]))).unwrap();
+        assert!(gaps.contains("3+ years"), "{gaps}");
+        // Filtered out of the ranking entirely (excluded, irrelevant, closed) is not eligible either.
+        assert!(eligibility_hold(None).is_some());
+        assert!(eligibility_hold(Some((false, vec![]))).is_some());
     }
 }

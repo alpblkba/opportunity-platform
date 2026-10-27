@@ -79,7 +79,7 @@ async fn seed_opportunity(pool: &Db, title: &str) -> Uuid {
     .fetch_one(pool)
     .await
     .unwrap();
-    sqlx::query_scalar(
+    let opportunity: Uuid = sqlx::query_scalar(
         "insert into opportunities (organization_id, dedupe_key, canonical_title, kind, advertised_state, search_text)
          values ($1, $2, $3, 'employment', 'advertised', $3) returning id",
     )
@@ -88,8 +88,29 @@ async fn seed_opportunity(pool: &Db, title: &str) -> Uuid {
     .bind(title)
     .fetch_one(pool)
     .await
-    .unwrap()
+    .unwrap();
+    // The open posting a discovered opportunity has, at the mock ATS. Standing policies cover only
+    // an opportunity's own posting from its own source, so without it nothing could be authorized.
+    let source: Uuid = sqlx::query_scalar(
+        "insert into sources (key, display_name, kind, endpoint) values ('example-greenhouse', 'Example', 'manual', '{\"kind\":\"manual\"}')
+         on conflict (key) do update set display_name = excluded.display_name returning id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query("insert into postings (source_id, native_id, opportunity_id, url, title, content_hash) values ($1, $2, $3, $4, $5, 'fixture')")
+        .bind(source)
+        .bind(Uuid::new_v4().to_string())
+        .bind(opportunity)
+        .bind(MOCK_DESTINATION)
+        .bind(title)
+        .execute(pool)
+        .await
+        .unwrap();
+    opportunity
 }
+
+const MOCK_DESTINATION: &str = "http://127.0.0.1:8099/apply/single";
 
 async fn approved_identity_facts(pool: &Db) {
     for (key, value) in [
@@ -338,6 +359,7 @@ async fn a_standard_thesis_application_follows_the_same_policy_as_an_employment_
         .execute(&db.pool)
         .await
         .unwrap();
+    posting(&db.pool, "institut-academic", thesis, MOCK_DESTINATION).await;
     let thesis_app = applications::create_application(&db.pool, thesis, None)
         .await
         .unwrap();
@@ -558,13 +580,18 @@ async fn product_policy_is_bound_to_the_discovered_destination_and_profile() {
         .execute(&db.pool)
         .await
         .unwrap();
+    sqlx::query("delete from postings where opportunity_id=$1")
+        .bind(opportunity)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let mut ctx = context(app.id, "example-greenhouse", "payload", Route::Auto).await;
     assert!(!applications::decide_authorization(&db.pool, &ctx)
         .await
         .unwrap()
         .0
         .is_permitted());
-    let source: Uuid = sqlx::query_scalar("insert into sources(key,display_name,kind,endpoint) values('example-greenhouse','Example','greenhouse','{\"kind\":\"greenhouse\",\"board_token\":\"example\"}') returning id")
+    let source: Uuid = sqlx::query_scalar("insert into sources(key,display_name,kind,endpoint) values('example-greenhouse','Example','greenhouse','{\"kind\":\"greenhouse\",\"board_token\":\"example\"}') on conflict (key) do update set display_name=excluded.display_name returning id")
         .fetch_one(&db.pool).await.unwrap();
     sqlx::query("insert into postings(source_id,native_id,opportunity_id,url,title,content_hash) values($1,'example',$2,$3,'Memory engineer','example')")
         .bind(source).bind(opportunity).bind(ctx.destination).execute(&db.pool).await.unwrap();
@@ -1172,6 +1199,14 @@ async fn an_application_is_only_submitted_when_an_attempt_carries_real_evidence(
     applications::set_status(
         &db.pool,
         application.id,
+        "submitting",
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    applications::set_status(
+        &db.pool,
+        application.id,
         "submitted",
         serde_json::json!({ "receipt": "receipt-1" }),
     )
@@ -1575,6 +1610,15 @@ async fn manual_tracking_persists_notes_and_owner_history_without_a_submission_a
             .status,
         "submitted"
     );
+    assert!(
+        applications::set_status(&db.pool, app.id, "submitting", serde_json::json!({}))
+            .await
+            .is_err(),
+        "a submitted application never starts submitting again"
+    );
+    applications::update_tracking(&db.pool, app.id, "saved", "")
+        .await
+        .unwrap();
     applications::set_status(&db.pool, app.id, "submitting", serde_json::json!({}))
         .await
         .unwrap();
@@ -1643,5 +1687,711 @@ async fn the_owner_pause_and_daily_cap_refuse_submissions_above_every_policy() {
         .await
         .unwrap()
         .is_none());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_source_that_keeps_failing_alerts_the_owner_once_per_outage() {
+    let db = require_db!();
+    approved_identity_facts(&db.pool).await;
+    let source: Uuid = sqlx::query_scalar(
+        "insert into sources (key, display_name, kind, endpoint, enabled, consecutive_failures)
+         values ('failing-board', 'Failing Board', 'greenhouse', '{\"kind\":\"greenhouse\",\"board_token\":\"failing\"}', true, 2) returning id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let alerts = || async {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from notifications where kind='source_failing' and application_id is null",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+
+    // Below the threshold the scheduler's own retries are still working.
+    opportunity_core::product::alert_failing_sources(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(alerts().await, 0);
+
+    sqlx::query("update sources set consecutive_failures=3 where id=$1")
+        .bind(source)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        opportunity_core::product::alert_failing_sources(&db.pool)
+            .await
+            .unwrap();
+    }
+    assert_eq!(alerts().await, 1, "one alert per outage, not per check");
+
+    // Recovered, then failing again: a new outage.
+    sqlx::query("update sources set last_success_at=now(), consecutive_failures=4 where id=$1")
+        .bind(source)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    opportunity_core::product::alert_failing_sources(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(alerts().await, 2);
+    db.cleanup().await;
+}
+
+async fn posting(pool: &Db, source_key: &str, opportunity: Uuid, url: &str) {
+    let source: Uuid = sqlx::query_scalar(
+        "insert into sources (key, display_name, kind, endpoint) values ($1, $1, 'manual', '{\"kind\":\"manual\"}')
+         on conflict (key) do update set display_name = excluded.display_name returning id",
+    )
+    .bind(source_key)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query("insert into postings (source_id, native_id, opportunity_id, url, title, content_hash) values ($1, $2, $3, $4, 'fixture', 'fixture')")
+        .bind(source)
+        .bind(Uuid::new_v4().to_string())
+        .bind(opportunity)
+        .bind(url)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn permitted(pool: &Db, application: Uuid, source_key: &str, destination: &str) -> bool {
+    let mut ctx = context(application, source_key, "payload", Route::Auto).await;
+    ctx.destination = destination;
+    applications::decide_authorization(pool, &ctx)
+        .await
+        .unwrap()
+        .0
+        .is_permitted()
+}
+
+#[tokio::test]
+async fn a_policy_without_a_profile_still_binds_opportunity_source_and_destination() {
+    let db = require_db!();
+    let application = application_ready_to_submit(&db.pool, "Firmware Engineer").await;
+    enabled_policy(&db.pool, "example-greenhouse").await;
+    assert!(
+        permitted(
+            &db.pool,
+            application,
+            "example-greenhouse",
+            MOCK_DESTINATION
+        )
+        .await
+    );
+
+    // Another opportunity's posting, a destination the caller merely names, another hostname for
+    // the same form, and another source the posting did not come from: none is covered.
+    let other = seed_opportunity(&db.pool, "Other role").await;
+    posting(
+        &db.pool,
+        "example-greenhouse",
+        other,
+        "http://127.0.0.1:8099/apply/other",
+    )
+    .await;
+    assert!(
+        !permitted(
+            &db.pool,
+            application,
+            "example-greenhouse",
+            "http://127.0.0.1:8099/apply/other"
+        )
+        .await
+    );
+    assert!(
+        !permitted(
+            &db.pool,
+            application,
+            "example-greenhouse",
+            "https://job-boards.greenhouse.io/elsewhere/jobs/1"
+        )
+        .await
+    );
+    assert!(
+        !permitted(
+            &db.pool,
+            application,
+            "example-greenhouse",
+            "http://localhost:8099/apply/single"
+        )
+        .await
+    );
+    let other_policy = applications::create_policy(
+        &db.pool,
+        NewPolicy {
+            name: "other source".into(),
+            source_keys: vec!["other-source".into()],
+            max_per_day: Some(5),
+            max_total: Some(20),
+            expires_in_days: Some(30),
+        },
+    )
+    .await
+    .unwrap();
+    applications::set_policy_state(&db.pool, other_policy.id, true, false)
+        .await
+        .unwrap();
+    assert!(!permitted(&db.pool, application, "other-source", MOCK_DESTINATION).await);
+
+    // A posting pointing at the cloud metadata server is never a destination, whatever links it.
+    let opportunity: Uuid =
+        sqlx::query_scalar("select opportunity_id from applications where id=$1")
+            .bind(application)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    posting(
+        &db.pool,
+        "example-greenhouse",
+        opportunity,
+        "http://169.254.169.254/latest/meta-data",
+    )
+    .await;
+    assert!(
+        !permitted(
+            &db.pool,
+            application,
+            "example-greenhouse",
+            "http://169.254.169.254/latest/meta-data"
+        )
+        .await
+    );
+
+    // A closed posting no longer authorizes anything.
+    sqlx::query("update postings set closed_at = now() where opportunity_id = $1")
+        .bind(opportunity)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !permitted(
+            &db.pool,
+            application,
+            "example-greenhouse",
+            MOCK_DESTINATION
+        )
+        .await
+    );
+    db.cleanup().await;
+}
+
+#[test]
+fn only_https_employer_hosts_or_loopback_are_destinations() {
+    for ok in [
+        "https://job-boards.greenhouse.io/acme/jobs/1",
+        "https://jobs.lever.co/acme/abc/apply",
+        "http://127.0.0.1:8099/apply/single",
+        "http://[::1]:8099/apply",
+    ] {
+        assert!(applications::destination_is_safe(ok), "{ok}");
+    }
+    for bad in [
+        "http://job-boards.greenhouse.io/acme/jobs/1",
+        "https://user:pass@jobs.lever.co/acme",
+        "https://jobs.lever.co:8443/acme",
+        "https://10.0.0.5/apply",
+        "https://169.254.169.254/latest/meta-data",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "https://printer.local/apply",
+        "https://intranet/apply",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "not a url",
+    ] {
+        assert!(!applications::destination_is_safe(bad), "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn status_changes_follow_the_submission_lifecycle() {
+    let db = require_db!();
+    let application = application_ready_to_submit(&db.pool, "Firmware Engineer").await;
+    let move_to = |status: &'static str| {
+        applications::set_status(&db.pool, application, status, serde_json::json!({}))
+    };
+    // Nothing reaches a submission outcome without submitting first.
+    for status in [
+        "submitted",
+        "submission_unknown",
+        "interview",
+        "rejected",
+        "withdrawn",
+    ] {
+        assert!(move_to(status).await.is_err(), "saved -> {status}");
+    }
+    move_to("submitting").await.unwrap();
+    assert!(
+        move_to("preparing").await.is_err(),
+        "no preparing while a submission runs"
+    );
+    move_to("submission_unknown").await.unwrap();
+    // An uncertain outcome is never retried or re-prepared automatically, and is never a receipt.
+    for status in [
+        "submitting",
+        "preparing",
+        "ready",
+        "submitted",
+        "failed",
+        "saved",
+    ] {
+        assert!(
+            move_to(status).await.is_err(),
+            "submission_unknown -> {status}"
+        );
+    }
+    let error = move_to("submitting").await.unwrap_err().to_string();
+    assert!(error.contains("submission_unknown"), "{error}");
+
+    let second = application_ready_to_submit(&db.pool, "Memory Engineer").await;
+    for (status, ok) in [
+        ("preparing", true),
+        ("ready", true),
+        ("submitting", true),
+        ("submitted", true),
+        ("submitting", false),
+        ("preparing", false),
+        ("unsupported", false),
+    ] {
+        let result =
+            applications::set_status(&db.pool, second, status, serde_json::json!({})).await;
+        assert_eq!(result.is_ok(), ok, "-> {status}: {result:?}");
+    }
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn submission_is_refused_before_any_attempt_for_a_closed_lifecycle_or_unsafe_destination() {
+    let db = require_db!();
+    let application = application_ready_to_submit(&db.pool, "Firmware Engineer").await;
+    let attempts = || {
+        sqlx::query_scalar::<_, i64>("select count(*) from application_attempts")
+            .fetch_one(&db.pool)
+    };
+    let unsafe_destination = workflow::submit(
+        &db.pool,
+        application,
+        "http://169.254.169.254/latest",
+        "mock",
+        None,
+    )
+    .await;
+    assert!(unsafe_destination
+        .unwrap_err()
+        .to_string()
+        .contains("HTTPS employer address"));
+    assert!(applications::issue_token(
+        &db.pool,
+        application,
+        "https://10.1.2.3/apply",
+        "mock",
+        "payload",
+        5
+    )
+    .await
+    .is_err());
+    applications::set_status(&db.pool, application, "submitting", serde_json::json!({}))
+        .await
+        .unwrap();
+    applications::set_status(
+        &db.pool,
+        application,
+        "submission_unknown",
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    let again = workflow::submit(&db.pool, application, MOCK_DESTINATION, "mock", None).await;
+    assert!(again
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be submitted again"));
+    assert_eq!(
+        attempts().await.unwrap(),
+        0,
+        "the refusals happened before any attempt or browser"
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn dashboard_counts_cover_every_application_and_never_count_uncertain_or_failed_as_applied() {
+    let db = require_db!();
+    let seed = seed_opportunity(&db.pool, "seed").await;
+    let org: Uuid = sqlx::query_scalar("select organization_id from opportunities where id=$1")
+        .bind(seed)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("insert into opportunities (organization_id, dedupe_key, canonical_title, kind, advertised_state, search_text)
+                 select $1, 'bulk-' || g, 'Bulk ' || g, 'employment', 'advertised', 'bulk' from generate_series(1, 260) g")
+        .bind(org).execute(&db.pool).await.unwrap();
+    // 150 confirmed with a receipt, 40 owner-reported, 30 uncertain, 25 failed, 15 queued.
+    sqlx::query("insert into applications (owner_id, opportunity_id, status, auto_resume)
+                 select (select id from owners limit 1), o.id,
+                        case when n <= 150 then 'submitted' when n <= 190 then 'submitted' when n <= 220 then 'submission_unknown'
+                             when n <= 245 then 'failed' else 'saved' end, n > 245
+                 from (select id, row_number() over (order by dedupe_key) n from opportunities where dedupe_key like 'bulk-%') o")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("insert into application_attempts (application_id, idempotency_key, destination, payload_hash, state)
+                 select a.id, a.id::text, 'https://jobs.lever.co/x', 'p', case when o.n <= 150 then 'submitted' when o.n <= 220 then 'unknown' else 'failed' end
+                 from applications a join (select id, row_number() over (order by dedupe_key) n from opportunities where dedupe_key like 'bulk-%') o on o.id = a.opportunity_id
+                 where o.n <= 150 or (o.n > 190 and o.n <= 245)")
+        .execute(&db.pool).await.unwrap();
+    let counts = opportunity_core::product::application_counts(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(counts["confirmed"], 150, "{counts}");
+    assert_eq!(counts["reported"], 40, "{counts}");
+    assert_eq!(counts["uncertain"], 30, "{counts}");
+    assert_eq!(counts["failed"], 25, "{counts}");
+    assert_eq!(counts["queued"], 15, "{counts}");
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_source_that_never_succeeds_is_reminded_on_a_widening_schedule_not_silenced() {
+    let db = require_db!();
+    let source: Uuid = sqlx::query_scalar(
+        "insert into sources (key, display_name, kind, endpoint, enabled, consecutive_failures)
+         values ('never-worked', 'Never Worked', 'greenhouse', '{\"kind\":\"greenhouse\",\"board_token\":\"never\"}', true, 3) returning id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let alerts = || {
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from notifications where kind='source_failing'",
+        )
+        .fetch_one(&db.pool)
+    };
+    let tick = || opportunity_core::product::alert_failing_sources(&db.pool);
+    let age = |days: i32| {
+        sqlx::query(
+            "update sources set created_at = now() - make_interval(days => $2) where id = $1",
+        )
+        .bind(source)
+        .bind(days)
+        .execute(&db.pool)
+    };
+    for _ in 0..3 {
+        tick().await.unwrap();
+    }
+    assert_eq!(
+        alerts().await.unwrap(),
+        1,
+        "first alert once, however many ticks"
+    );
+    for (days, expected) in [(1, 2), (2, 2), (8, 3), (8, 3), (31, 4), (65, 5)] {
+        age(days).await.unwrap();
+        tick().await.unwrap();
+        tick().await.unwrap();
+        assert_eq!(alerts().await.unwrap(), expected, "outage {days} days old");
+    }
+    let payload: serde_json::Value = sqlx::query_scalar("select payload from notifications where kind='source_failing' order by created_at desc limit 1")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(
+        (
+            payload["never_succeeded"].as_bool(),
+            payload["reminder"].as_bool()
+        ),
+        (Some(true), Some(true))
+    );
+    // A disabled source is the owner's decision, not an outage.
+    sqlx::query(
+        "update sources set enabled=false, created_at = now() - interval '400 days' where id=$1",
+    )
+    .bind(source)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    tick().await.unwrap();
+    assert_eq!(alerts().await.unwrap(), 5);
+    db.cleanup().await;
+}
+
+async fn status_of(pool: &Db, id: Uuid) -> String {
+    applications::get_application(pool, id)
+        .await
+        .unwrap()
+        .status
+}
+
+async fn automated(pool: &Db, id: Uuid) -> bool {
+    sqlx::query_scalar("select auto_resume from applications where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn event_count(pool: &Db, application: Uuid, kind: &str) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from application_events where application_id = $1 and kind = $2",
+    )
+    .bind(application)
+    .bind(kind)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn closed_applications_never_reenter_automation_without_the_owner_reopening_them() {
+    let db = require_db!();
+    for closed in ["withdrawn", "rejected", "interview"] {
+        let app = application_ready_to_submit(&db.pool, closed).await;
+        applications::update_tracking(&db.pool, app, closed, "")
+            .await
+            .unwrap();
+        let error = applications::queue_for_automation(&db.pool, app)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Reopen it first"), "{closed}: {error}");
+        assert_eq!(status_of(&db.pool, app).await, closed);
+        assert!(
+            !automated(&db.pool, app).await,
+            "{closed} stays out of automation"
+        );
+        // Reopening is two explicit owner acts, each recorded: tracking back to saved, then queueing.
+        applications::update_tracking(&db.pool, app, "saved", "reopened")
+            .await
+            .unwrap();
+        assert!(
+            !automated(&db.pool, app).await,
+            "reopening alone does not automate"
+        );
+        applications::queue_for_automation(&db.pool, app)
+            .await
+            .unwrap();
+        assert!(automated(&db.pool, app).await);
+        assert_eq!(event_count(&db.pool, app, "owner_queued").await, 1);
+        assert!(event_count(&db.pool, app, "manual_tracking").await >= 2);
+    }
+    let unsupported = application_ready_to_submit(&db.pool, "unsupported").await;
+    applications::set_status(&db.pool, unsupported, "unsupported", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(applications::queue_for_automation(&db.pool, unsupported)
+        .await
+        .is_err());
+
+    // An attempt that landed or may have landed blocks queueing, even after the owner reset tracking.
+    let attempted = application_ready_to_submit(&db.pool, "attempted").await;
+    applications::begin_attempt(
+        &db.pool,
+        attempted,
+        MOCK_DESTINATION,
+        "hash",
+        "token",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let error = applications::queue_for_automation(&db.pool, attempted)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("may have reached the employer"), "{error}");
+
+    // Submitted and uncertain applications are left exactly as they are.
+    let done = application_ready_to_submit(&db.pool, "done").await;
+    applications::set_status(&db.pool, done, "submitting", serde_json::json!({}))
+        .await
+        .unwrap();
+    applications::set_status(&db.pool, done, "submitted", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        applications::queue_for_automation(&db.pool, done)
+            .await
+            .unwrap()
+            .status,
+        "submitted"
+    );
+    assert_eq!(event_count(&db.pool, done, "owner_queued").await, 0);
+
+    // Answering resumes only what the queue was already working on.
+    let manual = application_ready_to_submit(&db.pool, "manual").await;
+    applications::set_status(&db.pool, manual, "needs_review", serde_json::json!({}))
+        .await
+        .unwrap();
+    applications::resume_after_answers(&db.pool, manual)
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db.pool, manual).await, "needs_review");
+    sqlx::query("update applications set auto_resume = true where id = $1")
+        .bind(manual)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    applications::resume_after_answers(&db.pool, manual)
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db.pool, manual).await, "saved");
+    assert_eq!(event_count(&db.pool, manual, "answers_resumed").await, 1);
+    db.cleanup().await;
+}
+
+async fn notifications(pool: &Db, kind: &str) -> i64 {
+    sqlx::query_scalar("select count(*) from notifications where kind = $1")
+        .bind(kind)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn backdate(pool: &Db, application: Uuid) {
+    sqlx::query("update applications set updated_at = now() - interval '11 minutes' where id = $1")
+        .bind(application)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("update application_attempts set started_at = now() - interval '11 minutes' where application_id = $1").bind(application).execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_receipt_survives_a_crash_at_any_point_and_is_never_followed_by_another_submission() {
+    let db = require_db!();
+    let start = |title: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let app = application_ready_to_submit(&pool, title).await;
+            let (attempt, _) = applications::begin_attempt(
+                &pool,
+                app,
+                MOCK_DESTINATION,
+                "hash",
+                "token",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            applications::set_status(&pool, app, "submitting", serde_json::json!({}))
+                .await
+                .unwrap();
+            (app, attempt.id)
+        }
+    };
+
+    // The normal path: attempt, status and notification in one transaction; recovery adds nothing.
+    let (app, attempt) = start("normal").await;
+    applications::finish_submission(
+        &db.pool,
+        app,
+        attempt,
+        applications::Outcome {
+            attempt_state: "submitted",
+            receipt: Some("receipt-1"),
+            diagnostic: None,
+            evidence: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    backdate(&db.pool, app).await;
+    applications::recover_interrupted(&db.pool).await.unwrap();
+    assert_eq!(
+        applications::get_application(&db.pool, app)
+            .await
+            .unwrap()
+            .status,
+        "submitted"
+    );
+    assert_eq!(notifications(&db.pool, "submitted").await, 1);
+
+    // What the old three-statement code could leave: a receipt recorded, the status and the email not.
+    let (app, attempt) = start("half finished").await;
+    sqlx::query("update application_attempts set state = 'submitted', receipt = 'receipt-2', finished_at = now() where id = $1").bind(attempt).execute(&db.pool).await.unwrap();
+    backdate(&db.pool, app).await;
+    for _ in 0..2 {
+        applications::recover_interrupted(&db.pool).await.unwrap();
+    }
+    assert_eq!(
+        applications::get_application(&db.pool, app)
+            .await
+            .unwrap()
+            .status,
+        "submitted",
+        "a receipt is never reported as unknown"
+    );
+    assert_eq!(notifications(&db.pool, "submitted").await, 2);
+    assert_eq!(notifications(&db.pool, "submission_uncertain").await, 0);
+    let ctx = context(app, "example-greenhouse", "hash", Route::Auto).await;
+    let (decision, _, _) = applications::decide_authorization(&db.pool, &ctx)
+        .await
+        .unwrap();
+    assert!(
+        !decision.is_permitted(),
+        "never submitted twice: {}",
+        decision.reason()
+    );
+
+    // A crash before the outcome committed: nobody knows, the owner is told once, nothing retries.
+    let (app, attempt) = start("before commit").await;
+    backdate(&db.pool, app).await;
+    for _ in 0..2 {
+        applications::recover_interrupted(&db.pool).await.unwrap();
+    }
+    assert_eq!(
+        applications::get_application(&db.pool, app)
+            .await
+            .unwrap()
+            .status,
+        "submission_unknown"
+    );
+    let state: String = sqlx::query_scalar("select state from application_attempts where id = $1")
+        .bind(attempt)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "unknown");
+    assert_eq!(notifications(&db.pool, "submission_uncertain").await, 1);
+
+    // A receipt is kept even when the status cannot move, and still blocks another attempt.
+    let stuck = application_ready_to_submit(&db.pool, "status cannot move").await;
+    let (attempt, _) = applications::begin_attempt(
+        &db.pool,
+        stuck,
+        MOCK_DESTINATION,
+        "hash",
+        "token",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    applications::finish_submission(
+        &db.pool,
+        stuck,
+        attempt.id,
+        applications::Outcome {
+            attempt_state: "submitted",
+            receipt: Some("receipt-3"),
+            diagnostic: None,
+            evidence: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let receipt: Option<String> =
+        sqlx::query_scalar("select receipt from application_attempts where id = $1")
+            .bind(attempt.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(receipt.as_deref(), Some("receipt-3"));
+    assert_eq!(event_count(&db.pool, stuck, "outcome_recorded").await, 1);
+    assert!(applications::queue_for_automation(&db.pool, stuck)
+        .await
+        .is_err());
     db.cleanup().await;
 }

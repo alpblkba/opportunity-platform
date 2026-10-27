@@ -67,7 +67,7 @@ try{
  const rank=title=>home.jobs.findIndex(j=>j.canonical_title===title);
  assert.ok(rank('Memory systems intern')>=0&&rank('Memory systems intern')<rank('Junior memory engineer')&&rank('Junior memory engineer')<rank('Senior memory engineer'),JSON.stringify(home.jobs.map(j=>[j.canonical_title,j.score])));
  assert.equal(rank('Marketing intern'),-1);
- assert.equal(home.ranking_policy,'career-priority-v2');
+ assert.equal(home.ranking_policy,'career-priority-v3');
  const cvId=home.cv.id;
  await page.reload();await page.getByText('synthetic-test-cv.txt').waitFor();assert.equal((await api('/home')).cv.id,cvId);
  app.kill('SIGTERM');await new Promise(r=>app.on('exit',r));app=launch(['serve','--port','8897']);await until(async()=>{try{return(await fetch(appOrigin+'/ready')).ok;}catch{return false;}});

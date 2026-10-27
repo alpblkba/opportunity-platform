@@ -11,6 +11,7 @@ pub mod embeddings;
 pub mod ingest;
 pub mod mail;
 pub mod matching;
+pub mod ops;
 pub mod product;
 pub mod profiles;
 pub mod query;

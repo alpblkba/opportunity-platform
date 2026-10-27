@@ -2668,3 +2668,81 @@ async fn holding_the_lease_leaves_the_connection_pool_usable() {
     lease.release().await;
     db.cleanup().await;
 }
+
+#[tokio::test]
+async fn the_release_seed_adds_new_sources_but_never_resurrects_or_overwrites_the_owners_choices() {
+    let db = require_db!();
+    let seed = |keys: &[&str]| {
+        keys.iter()
+            .map(|k| format!("[[sources]]\nkey = \"{k}\"\nkind = \"greenhouse\"\norganization = \"Org {k}\"\nboard_token = \"{k}\"\nenabled = true\n"))
+            .collect::<String>()
+    };
+    let v1 = seed(&["alpha-greenhouse", "beta-greenhouse", "gamma-greenhouse"]);
+    let first = opportunity_core::config::import_release_seed(&db.pool, &v1)
+        .await
+        .unwrap();
+    assert_eq!(first.created.len(), 3, "{:?}", first.rejected);
+
+    // The owner deletes one, disables another and renames the third.
+    sqlx::query("delete from sources where key = 'alpha-greenhouse'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("update sources set enabled = false where key = 'beta-greenhouse'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("update sources set display_name = 'Renamed' where key = 'gamma-greenhouse'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // A restart on the same release, then an upgrade that adds a source: neither undoes any of that.
+    for text in [
+        v1.clone(),
+        seed(&[
+            "alpha-greenhouse",
+            "beta-greenhouse",
+            "gamma-greenhouse",
+            "delta-greenhouse",
+        ]),
+    ] {
+        let report = opportunity_core::config::import_release_seed(&db.pool, &text)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped_previously_seeded, vec!["alpha-greenhouse"]);
+    }
+    let rows: Vec<(String, bool, String)> =
+        sqlx::query_as("select key, enabled, display_name from sources order by key")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "beta-greenhouse".into(),
+                false,
+                "Org beta-greenhouse".into()
+            ),
+            (
+                "delta-greenhouse".into(),
+                true,
+                "Org delta-greenhouse".into()
+            ),
+            ("gamma-greenhouse".into(), true, "Renamed".into()),
+        ]
+    );
+
+    // The owner's explicit import is their decision, so it may bring a deleted source back, once.
+    let explicit = opportunity_core::config::import_sources(&db.pool, &v1)
+        .await
+        .unwrap();
+    assert_eq!(explicit.created, vec!["alpha-greenhouse"]);
+    assert!(opportunity_core::config::import_sources(&db.pool, &v1)
+        .await
+        .unwrap()
+        .created
+        .is_empty());
+    db.cleanup().await;
+}

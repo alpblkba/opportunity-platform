@@ -37,6 +37,8 @@ export interface Home {
   matches: number;
   discovered: number;
   applications: Application[];
+  source_health: { enabled: number; failing: number; never_succeeded: number; stale: number; last_success_at: string | null };
+  application_counts: { confirmed: number; reported: number; uncertain: number; failed: number; needs_review: number; queued: number; manual: number };
   questions: Question[];
   policies: { id: string; name: string; enabled: boolean; source_keys: string[]; profile_id: string; expires_at: string }[];
   last_updated: string | null;

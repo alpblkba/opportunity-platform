@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import App from "../App";
-const home = { cv:{id:"cv1",label:"stored-cv.pdf",created_at:"2026-10-25T08:00:00Z"},cv_ready:true,profiles:[{id:"firmware",name:"Firmware and platform systems"},{id:"memory",name:"Memory and operating systems"}],selected_profile:"memory",jobs:[],matches:0,discovered:10,applications:[],questions:[],policies:[],mail:[],email_configured:false,last_updated:null };
+const home = { cv:{id:"cv1",label:"stored-cv.pdf",created_at:"2026-10-25T08:00:00Z"},cv_ready:true,profiles:[{id:"firmware",name:"Firmware and platform systems"},{id:"memory",name:"Memory and operating systems"}],selected_profile:"memory",jobs:[],matches:0,discovered:10,applications:[],source_health:{enabled:3,failing:0,never_succeeded:0,stale:0,last_success_at:null},application_counts:{confirmed:0,reported:0,uncertain:0,failed:0,needs_review:0,queued:0,manual:0},questions:[],policies:[],mail:[],email_configured:false,last_updated:null };
 afterEach(()=>{cleanup();vi.unstubAllGlobals();window.history.replaceState({},"","/");});
 it("opens login immediately and shows the stored CV after authentication",async()=>{
  window.history.replaceState({},"","/login");
@@ -49,4 +49,15 @@ it("pauses and resumes every submission from one control",async()=>{
  expect(await screen.findByText('All submissions paused')).toBeDefined();
  fireEvent.click(screen.getByRole('button',{name:'Resume'}));
  await waitFor(()=>expect(fetch.mock.calls.some(c=>c[0]==='/api/home/pause'&&JSON.parse(String((c as unknown as [string,RequestInit])[1]?.body)).paused===false)).toBe(true));
+});
+it("counts applied from every application, never from the recent page or uncertain outcomes",async()=>{
+ const recent=[{id:'a1',opportunity_id:'j1',status:'submitted',title:'Engineer',employer:'Example',url:'https://example.test'}];
+ vi.stubGlobal('fetch',vi.fn(async(path:string)=>Response.json(path.endsWith('/home')?{...home,applications:recent,application_counts:{confirmed:140,reported:12,uncertain:3,failed:9,needs_review:0,queued:0,manual:0}}:{})));render(<App/>);
+ const overview=await screen.findByLabelText('Application overview');
+ expect(overview.textContent).toContain('152Applied');
+ expect(overview.textContent).toContain('3Outcome unknown');
+});
+it("never implies every source is healthy while one keeps failing",async()=>{
+ vi.stubGlobal('fetch',vi.fn(async(path:string)=>Response.json(path.endsWith('/home')?{...home,last_updated:'2026-10-27T08:00:00Z',source_health:{enabled:20,failing:2,never_succeeded:0,stale:1,last_success_at:'2026-10-27T08:00:00Z'}}:{})));render(<App/>);
+ expect(await screen.findByText(/2 of 20 employer sources keep failing to refresh/)).toBeDefined();
 });
