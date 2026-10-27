@@ -24,7 +24,7 @@ gpg --batch --quiet --decrypt --output "$WORK/private.tar.gz" "$DIR/private.tar.
 docker run -d --rm --name "$NAME" --network none -e POSTGRES_USER=rehearsal -e POSTGRES_PASSWORD=rehearsal-only \
   -e POSTGRES_DB=rehearsal "$IMAGE" >/dev/null
 for _ in $(seq 1 60); do
-  docker exec "$NAME" pg_isready -U rehearsal -d rehearsal >/dev/null 2>&1 && break
+  docker exec "$NAME" pg_isready -h 127.0.0.1 -U rehearsal -d rehearsal >/dev/null 2>&1 && break
   sleep 1
 done
 docker exec -i "$NAME" pg_restore -U rehearsal -d rehearsal --no-owner --single-transaction --exit-on-error < "$WORK/database.dump"
