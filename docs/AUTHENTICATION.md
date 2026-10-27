@@ -226,3 +226,31 @@ Until every one of those passes, production keeps `ACCESS_MODE=cloudflare`.
 - **One account means one password.** There is no second factor in front of the native login. Cloudflare Access provided one; after the cutover, the password is the whole of it. A hardware key or a TOTP step is the obvious next piece of work.
 - **Sessions do not pin to a device.** A stolen cookie works until it expires or is revoked.
 - **Rate limiting is per address and in memory.** Bounded at 512 addresses with eviction and a fifteen-minute ceiling, so guessing is useless and the denial it can cause the owner is capped — but an attacker who can reach the form can still cost the owner fifteen minutes at a time. The Cloudflare rate-limiting rule recommended above is the answer to that.
+
+## Cutover assessment (2026-10-27)
+
+Production runs `1043ab9` with `ACCESS_MODE=cloudflare` (read from the VM), so every visitor to
+`opportunities.alpblkba.dev` meets the Access login of team `damp-math-e853` before the application.
+Nothing in this assessment changed Cloudflare or production.
+
+Verified locally on the working tree, `ACCESS_MODE=native` against a throwaway database:
+- `/` serves the original landing page and asks only `/api/auth/session`.
+- `/workspace` signed out renders the login form, and private `/api` routes return 401, including the
+  new `/api/ops/status`.
+- A wrong password is refused, the right one opens the workspace, and logout ends the session.
+
+The native suite covers the rest: Argon2id hashing, identical bodies for unknown and wrong
+credentials, the per-address limiter, Origin checks on unsafe methods, `__Host-` cookies over HTTPS,
+12-hour expiry and revocation.
+
+**Options for a public landing page, and their trade-offs:**
+
+| Option | Second factor kept | Effort | Notes |
+| --- | --- | --- | --- |
+| Native cutover (this ladder, then Bypass/Everyone) | No: password only | config + one policy | The landing page is at the hostname the owner asked for. Add the login rate-limit rule first. |
+| Native cutover after adding TOTP | Yes (TOTP) | a migration, enrolment CLI, a login step, UI | Not implemented. Recommended before relying on password-only access to the CV and the right to submit applications. |
+| Separate public hostname for the landing page only | Yes (Cloudflare OTP) | a static host, plus "Log in" linking to the protected hostname | Keeps today's protection unchanged; the landing page lives at a different address. |
+| Path-scoped Bypass on `/` only | n/a | none | Does not work: see "Why path-scoped Bypass is the wrong shape". |
+
+**Lockout recovery stays the one documented above.** Put the Allow policy back first, then set
+`ACCESS_MODE=cloudflare`. A lost password is reset on the VM with `opportunity user passwd`.
