@@ -11,7 +11,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 const post = <T,>(path: string, body = {}) => request<T>(path, { method: "POST", body: JSON.stringify(body) });
 export const api = {
-  session: () => request<{ email: string; display_name: string }>("/auth/session"),
+  session: () => request<{ email: string; display_name: string; via: string }>("/auth/session"),
   login: (email: string, password: string) => post("/auth/login", { email, password }),
   logout: () => post("/auth/logout"),
   home: () => request<Home>("/home"),

@@ -2,8 +2,9 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, expect, it, vi } from "vitest";
 import App from "../App";
 const home = { cv:{id:"cv1",label:"stored-cv.pdf",created_at:"2026-10-25T08:00:00Z"},cv_ready:true,profiles:[{id:"firmware",name:"Firmware and platform systems"},{id:"memory",name:"Memory and operating systems"}],selected_profile:"memory",jobs:[],matches:0,discovered:10,applications:[],questions:[],policies:[],mail:[],email_configured:false,last_updated:null };
-afterEach(()=>{cleanup();vi.unstubAllGlobals();});
+afterEach(()=>{cleanup();vi.unstubAllGlobals();window.history.replaceState({},"","/");});
 it("opens login immediately and shows the stored CV after authentication",async()=>{
+ window.history.replaceState({},"","/login");
  let signed=false;
  const fetch=vi.fn(async(path:string)=>{
   if(path.endsWith('/login')){signed=true;return Response.json({});}

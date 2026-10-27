@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, type Home, type Question } from "./api";
+import LandingPage from "./components/LandingPage";
 import LoginPage from "./components/LoginPage";
 
 const labels: Record<string, string> = { saved: "Queued", preparing: "Checking form", ready: "Ready · authorization needed", needs_review: "Needs input", submitting: "Submitting", submitted: "Submitted", submission_unknown: "Unconfirmed · check with employer", failed: "Failed", unsupported: "Manual completion", interview: "Interview", rejected: "Rejected", withdrawn: "Withdrawn" };
@@ -14,40 +15,60 @@ function QuestionForm({ question, onAnswer }: { question: Question; onAnswer: (a
   </form>;
 }
 
+type Route = "landing" | "login" | "workspace";
+const routeOf = (path: string): Route => path === "/login" ? "login" : path === "/" || path === "/index.html" ? "landing" : "workspace";
+
 export default function App() {
-  const [session, setSession] = useState<"checking" | boolean>("checking");
+  const [route, setRoute] = useState<Route>(() => routeOf(window.location.pathname));
+  // null when nobody is signed in; `via` says whether the identity came from a password or the Cloudflare layer.
+  const [session, setSession] = useState<"checking" | null | { via: string }>("checking");
+  const [expired, setExpired] = useState(false);
+  const [upstream, setUpstream] = useState("");
   const [home, setHome] = useState<Home | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const input = useRef<HTMLInputElement>(null);
   const generation = useRef(0);
-  const check = useCallback(async () => {
-    try { await api.session(); setSession(true); window.history.replaceState({}, "", "/"); }
-    catch (e) { setSession(false); if (!(e instanceof ApiError && e.status === 401)) setError("The application is unavailable. Try again shortly."); }
+  const go = useCallback((path: string, replace = false) => {
+    if (window.location.pathname !== path) window.history[replace ? "replaceState" : "pushState"]({}, "", path);
+    setRoute(routeOf(path));
   }, []);
+  useEffect(() => { const onPop = () => setRoute(routeOf(window.location.pathname)); window.addEventListener("popstate", onPop); return () => window.removeEventListener("popstate", onPop); }, []);
+  // The server decides every time: the bundle is public, so nothing the browser believes about a session counts.
+  const check = useCallback(async () => {
+    try { setSession(await api.session()); setExpired(false); }
+    catch (e) { setSession(null); if (e instanceof ApiError && e.status === 401) setUpstream(e.needs && e.needs !== "native" ? e.message : ""); else setError("The application is unavailable. Try again shortly."); }
+  }, []);
+  const lost = useCallback(() => { setSession(null); setHome(null); setExpired(true); }, []);
   const reload = useCallback(async () => {
     const current = ++generation.current;
     try { const data = await api.home(); if (current === generation.current) setHome(data); }
-    catch (e) { if (e instanceof ApiError && e.status === 401) { setSession(false); setHome(null); } else setError(e instanceof Error ? e.message : "Could not load opportunities."); }
-  }, []);
+    catch (e) { if (e instanceof ApiError && e.status === 401) lost(); else setError(e instanceof Error ? e.message : "Could not load opportunities."); }
+  }, [lost]);
   useEffect(() => { void check(); }, [check]);
-  useEffect(() => { if (session !== true) return; void reload(); const timer = window.setInterval(() => void reload(), 15000); return () => clearInterval(timer); }, [session, reload]);
+  const native = session !== "checking" && session?.via === "password";
+  // A Cloudflare identity never had a front door at /, and a signed-in owner has nothing to do on /login.
+  useEffect(() => { if (session && session !== "checking" && (route === "login" || (route === "landing" && !native))) go("/workspace", true); }, [session, native, route, go]);
+  useEffect(() => { if (!session || session === "checking" || route !== "workspace") return; void reload(); const timer = window.setInterval(() => void reload(), 15000); return () => clearInterval(timer); }, [session, route, reload]);
   const act = async (key: string, action: () => Promise<unknown>, message = "") => {
     setBusy(key); setError(""); setNotice("");
     try { await action(); await reload(); setNotice(message); }
-    catch (e) { if (e instanceof ApiError && e.status === 401) setSession(false); setError(e instanceof Error ? e.message : "Please try again."); }
+    catch (e) { if (e instanceof ApiError && e.status === 401) lost(); setError(e instanceof Error ? e.message : "Please try again."); }
     finally { setBusy(""); }
   };
+  // The public page asks the server for nothing private and renders before the session check finishes.
+  if (route === "landing" && (session === "checking" || !session || native)) return <LandingPage signedIn={native} onLogin={() => go(native ? "/workspace" : "/login")} />;
   if (session === "checking") return <main className="loading" role="status">Opening Opportunities…</main>;
-  if (!session) return <><LoginPage onSignedIn={() => void check()} />{error && <p className="login-error" role="alert">{error}</p>}</>;
+  if (!session && upstream) return <main className="login" id="main"><div className="login-card"><h1>Alp&apos;s Opportunity Platform</h1><p className="notice error" role="alert">{upstream}</p><p className="login-sub">This deployment checks identity before the application. Reload to go through it again.</p><button type="button" className="primary" onClick={() => window.location.reload()}>Reload</button><p className="login-foot"><a href="https://alpblkba.dev/">← back to alpblkba.dev</a></p></div></main>;
+  if (!session) return <><LoginPage expired={expired} onSignedIn={() => void check()} />{error && <p className="login-error" role="alert">{error}</p>}</>;
   if (!home) return <main className="loading"><p role="status">Loading your opportunities…</p>{error && <p role="alert">{error}</p>}</main>;
   const applied = home.applications.filter(a => a.status === "submitted").length;
   const needing = new Set(home.questions.map(q => q.application_id)).size;
   const activePolicies = home.policies.filter(p => p.enabled && new Date(p.expires_at) > new Date());
   const profileName = home.profiles.find(p => p.id === home.selected_profile)?.name;
   return <main className="shell" id="main">
-    <header className="topbar"><span className="brand"><span className="brand-mark">O</span> Opportunity Platform</span><button className="quiet" onClick={() => void act("logout", async () => { await api.logout(); setSession(false); setHome(null); })}>Sign out</button></header>
+    <header className="topbar"><span className="brand"><span className="brand-mark">O</span> Opportunity Platform</span><button className="quiet" onClick={() => void api.logout().catch(() => undefined).then(() => { setSession(null); setHome(null); setExpired(false); go("/"); })}>Sign out</button></header>
     <section className="workspace" aria-labelledby="heading">
       <div className="heading-row"><div><h1 id="heading">Opportunities</h1><p className="muted">Your job search, automatically.</p></div><span className={`badge ${home.cv_ready ? "success" : "neutral"}`}>{home.cv_ready ? "CV uploaded" : "Add your CV"}</span></div>
       {error && <p className="message error" role="alert">{error}</p>}{notice && <p className="message" role="status">{notice}</p>}
