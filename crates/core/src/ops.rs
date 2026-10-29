@@ -23,8 +23,8 @@ pub async fn status(db: &Db) -> Result<Value, AppError> {
     let sources = source_health(db).await?;
     let notifications: Value = sqlx::query_scalar(
         "select jsonb_build_object(
-           'pending', count(*) filter (where delivered_at is null and delivery_state not in ('bounced','failed')),
-           'oldest_pending_minutes', (extract(epoch from now() - min(created_at) filter (where delivered_at is null and delivery_state not in ('bounced','failed'))) / 60)::int,
+           'pending', count(*) filter (where delivered_at is null and delivery_state in ('pending','accepted')),
+           'oldest_pending_minutes', (extract(epoch from now() - min(created_at) filter (where delivered_at is null and delivery_state in ('pending','accepted'))) / 60)::int,
            'undeliverable', count(*) filter (where delivery_state in ('bounced','failed')))
          from notifications",
     )

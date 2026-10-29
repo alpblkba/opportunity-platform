@@ -288,6 +288,13 @@ pub async fn create_rule(pool: &Db, rule: NewRule) -> Result<StoredRule, Profile
     if kind != ExclusionKind::Hidden && rule.value.trim().is_empty() {
         return Err(ProfileError::Invalid("rule value is empty".into()));
     }
+    if rule.value.chars().count() > 200
+        || rule.note.as_ref().is_some_and(|n| n.chars().count() > 500)
+    {
+        return Err(ProfileError::Invalid(
+            "a rule is at most 200 characters, its note at most 500".into(),
+        ));
+    }
     // A company rule is stored under its folded identity so matching is exact on the employer rather than on a substring of its name.
     let normalized = match kind {
         ExclusionKind::Company => normalize_organization(&rule.value),

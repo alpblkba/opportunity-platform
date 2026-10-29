@@ -153,3 +153,16 @@ a.landing-button:focus-visible {
     padding-bottom: 2rem;
   }
 }
+
+.application-info{flex:1;min-width:0}.manual-tracking{margin-top:10px}.manual-tracking summary{cursor:pointer;width:fit-content}.manual-tracking label{display:block;margin:12px 0;font-size:12px}.manual-tracking textarea{display:block;width:100%;min-height:80px;padding:10px;font:inherit;border:1px solid #3e4837;border-radius:8px;background:#141614;color:inherit}.manual-tracking select{margin-top:5px}.manual-tracking p{margin-top:8px}
+
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}.filters input[type=search]{flex:1 1 180px;min-width:0}.filters select{flex:0 1 auto;max-width:100%}
+.check{display:flex;align-items:center;gap:6px;font-size:13px}.badge.new{margin-left:8px}
+.job-actions .quiet{min-height:36px}.more{margin-top:6px}.more summary{cursor:pointer;width:fit-content;font-size:12px}
+.settings{margin-top:28px}.panel{border-top:1px solid #2a2f27;padding:12px 0}.panel summary{cursor:pointer;font-weight:600}
+.settings-form label{display:block;margin:10px 0;font-size:13px}.settings-form input:not([type=checkbox]),.settings-form select{display:block;width:100%;margin-top:4px}
+.plain-list{list-style:none;padding:0;margin:8px 0}.plain-list li{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid #222620}
+.plain-list li>div{min-width:0;overflow-wrap:anywhere}.row-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+@media (max-width:480px){.plain-list li{flex-direction:column}.row-actions{justify-content:flex-start}.filters select{flex:1 1 45%}}
+.job-actions{flex-wrap:wrap;row-gap:8px}
+.checklist{margin:6px 0 8px;padding-left:20px;display:grid;gap:2px}
