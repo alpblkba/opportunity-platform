@@ -634,7 +634,54 @@ pub struct ProductPolicy {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Narrowing the ranked list on the server, so a filter covers every match and not only the page
+/// shown. Every field is optional; text fields match case-insensitively.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct Filters {
+    pub stage: Option<String>,
+    pub country: Option<String>,
+    pub employer: Option<String>,
+    pub source: Option<String>,
+    pub eligibility: Option<String>,
+    pub q: Option<String>,
+    #[serde(default)]
+    pub saved: bool,
+}
+
+fn passes(job: &RankedJob, filters: &Filters, saved: &std::collections::HashSet<Uuid>) -> bool {
+    let has = |hay: &str, needle: &Option<String>| {
+        needle
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .is_none_or(|n| hay.to_lowercase().contains(&n.to_lowercase()))
+    };
+    let equals = |value: Option<&str>, wanted: &Option<String>| {
+        wanted
+            .as_deref()
+            .filter(|w| !w.is_empty())
+            .is_none_or(|w| value.is_some_and(|v| v.eq_ignore_ascii_case(w)))
+    };
+    equals(Some(job.career_stage), &filters.stage)
+        && equals(job.job.country_code.as_deref(), &filters.country)
+        && has(&job.job.organization, &filters.employer)
+        && equals(Some(job.source_key.as_str()), &filters.source)
+        && equals(Some(job.eligibility), &filters.eligibility)
+        && has(
+            &format!(
+                "{} {} {}",
+                job.job.canonical_title, job.job.organization, job.explanation
+            ),
+            &filters.q,
+        )
+        && (!filters.saved || saved.contains(&job.job.id))
+}
+
 pub async fn dashboard(db: &Db) -> Result<Value, AppError> {
+    dashboard_with(db, &Filters::default()).await
+}
+
+pub async fn dashboard_with(db: &Db, filters: &Filters) -> Result<Value, AppError> {
     let profile_id = selection(db).await?;
     let cv = documents::list(db)
         .await
@@ -650,10 +697,39 @@ pub async fn dashboard(db: &Db) -> Result<Value, AppError> {
                 .map(|p| json!({"id":p.id,"name":label}))
         })
         .collect();
-    let mut jobs = ranked(db, profile_id).await?;
+    let all_jobs = ranked(db, profile_id).await?;
+    let marks = crate::preferences::marks(db).await?;
+    let saved: std::collections::HashSet<Uuid> = marks
+        .iter()
+        .filter(|(_, m)| m == "saved")
+        .map(|(id, _)| *id)
+        .collect();
+    let options = |values: Vec<String>| {
+        let mut values: Vec<String> = values.into_iter().filter(|v| !v.is_empty()).collect();
+        values.sort();
+        values.dedup();
+        values
+    };
+    let filter_options = json!({
+        "stages": options(all_jobs.iter().map(|j| j.career_stage.to_owned()).collect()),
+        "countries": options(all_jobs.iter().filter_map(|j| j.job.country_code.clone()).collect()),
+        "sources": options(all_jobs.iter().map(|j| j.source_key.clone()).collect()),
+    });
+    let total_ranked = all_jobs.len();
+    let mut jobs: Vec<RankedJob> = all_jobs
+        .into_iter()
+        .filter(|j| passes(j, filters, &saved))
+        .collect();
     let matches = jobs.len();
     jobs.truncate(60);
-    let applications:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('id',a.id,'opportunity_id',a.opportunity_id,'status',a.status,'reason',a.route_reason,'title',o.canonical_title,'employer',org.display_name,'url',(select p.url from postings p where p.opportunity_id=o.id order by p.closed_at nulls first limit 1)) from applications a join opportunities o on o.id=a.opportunity_id join organizations org on org.id=o.organization_id order by a.updated_at desc limit 100").fetch_all(db).await?;
+    let marks: Vec<Value> = marks
+        .into_iter()
+        .map(|(id, mark)| json!({"opportunity_id": id, "mark": mark}))
+        .collect();
+    let exclusions = crate::preferences::exclusions(db).await?;
+    let previous_visit_at = crate::preferences::last_visit(db).await?;
+    let notification_preferences = crate::preferences::notification_preferences(db).await?;
+    let applications:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('id',a.id,'opportunity_id',a.opportunity_id,'status',a.status,'notes',a.notes,'reason',a.route_reason,'title',o.canonical_title,'employer',org.display_name,'cv_label',(select d.label from documents d where d.id=a.cv_document_id),'url',(select p.url from postings p where p.opportunity_id=o.id order by p.closed_at nulls first limit 1)) from applications a join opportunities o on o.id=a.opportunity_id join organizations org on org.id=o.organization_id order by a.updated_at desc limit 100").fetch_all(db).await?;
     let policies=sqlx::query_as::<_,ProductPolicy>("select id,name,enabled,source_keys,profile_id,expires_at from authorization_policies where profile_id is not null and revoked_at is null order by created_at desc").fetch_all(db).await?;
     let last_updated:Option<DateTime<Utc>>=sqlx::query_scalar("select max(finished_at) from source_runs where outcome in ('ok_complete','ok_verified_empty','partial','not_modified')").fetch_one(db).await?;
     let discovered: i64 =
@@ -664,9 +740,9 @@ pub async fn dashboard(db: &Db) -> Result<Value, AppError> {
     let counts = application_counts(db).await?;
     let source_health = crate::ops::source_health(db).await?;
     let (paused, cap) = workflow::brakes(db).await?;
-    let mail:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('application_id',application_id,'state',delivery_state,'error',delivery_error) from notifications where kind='submitted' order by created_at desc limit 100").fetch_all(db).await?;
+    let mail:Vec<Value>=sqlx::query_scalar("select jsonb_build_object('application_id',application_id,'state',case when delivery_state='pending' and delivered_at is not null then 'seen' else delivery_state end,'error',delivery_error) from notifications where kind='submitted' order by created_at desc limit 100").fetch_all(db).await?;
     Ok(
-        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"application_counts":counts,"source_health":source_health,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some(),"ranking_policy":RANKING_POLICY,"submissions_paused":paused,"max_automatic_per_day":cap}),
+        json!({"cv":cv,"profiles":profiles,"selected_profile":profile_id,"jobs":jobs,"matches":matches,"discovered":discovered,"applications":applications,"application_counts":counts,"source_health":source_health,"questions":questions,"policies":policies,"last_updated":last_updated,"mail":mail,"email_configured":crate::mail::configured(),"cv_ready":current_candidate(db).await?.is_some(),"ranking_policy":RANKING_POLICY,"total_ranked":total_ranked,"filter_options":filter_options,"marks":marks,"exclusions":exclusions,"previous_visit_at":previous_visit_at,"notification_preferences":notification_preferences,"submissions_paused":paused,"max_automatic_per_day":cap}),
     )
 }
 
@@ -731,6 +807,145 @@ pub async fn enqueue(db: &Db, opportunity_id: Uuid) -> Result<Uuid, AppError> {
         applications::create_application(db, opportunity_id, Some(selection(db).await?)).await?;
     // The owner's explicit queueing, with its own rules: closed applications are reopened first.
     Ok(applications::queue_for_automation(db, app.id).await?.id)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ExternalJob {
+    pub title: String,
+    pub employer: String,
+    pub url: String,
+    pub deadline_at: Option<DateTime<Utc>>,
+}
+
+/// One job link for one posting: no fragment, and a LinkedIn job reduced to its numeric id so its
+/// tracking parameters cannot make the same job look new.
+fn canonical_job_url(raw: &str) -> Result<reqwest::Url, AppError> {
+    let invalid = || AppError::Invalid("Paste the https link of the job posting.".into());
+    let mut url = reqwest::Url::parse(raw.trim()).map_err(|_| invalid())?;
+    if url.scheme() != "https" || url.host_str().is_none() || raw.len() > 2000 {
+        return Err(invalid());
+    }
+    url.set_fragment(None);
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host == "linkedin.com" || host.ends_with(".linkedin.com") {
+        let from_query = url
+            .query_pairs()
+            .find(|(k, _)| k == "currentJobId")
+            .map(|(_, v)| v.into_owned());
+        let from_path = url
+            .path_segments()
+            .and_then(|mut s| {
+                s.by_ref().find(|p| *p == "view")?;
+                s.next()
+            })
+            .map(|id| id.rsplit('-').next().unwrap_or(id).to_owned());
+        let id = from_query
+            .or(from_path)
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| {
+                AppError::Invalid("Use the link of one LinkedIn job (…/jobs/view/<number>).".into())
+            })?;
+        url = reqwest::Url::parse(&format!("https://www.linkedin.com/jobs/view/{id}/"))
+            .map_err(|_| invalid())?;
+    }
+    Ok(url)
+}
+
+/// Track a job the owner found somewhere this platform does not read, such as LinkedIn. The link is
+/// stored, never fetched; the application starts in manual completion with the current CV recorded,
+/// and only the owner's own tracking can mark it applied. The same link again returns the same one.
+pub async fn track_external(db: &Db, job: ExternalJob) -> Result<(Uuid, bool), AppError> {
+    let title = job.title.trim();
+    let employer = job.employer.trim();
+    if title.is_empty() || title.chars().count() > 300 {
+        return Err(AppError::Invalid(
+            "Give the job title, in at most 300 characters.".into(),
+        ));
+    }
+    if employer.is_empty() || employer.chars().count() > 200 {
+        return Err(AppError::Invalid(
+            "Name the employer, in at most 200 characters.".into(),
+        ));
+    }
+    let url = canonical_job_url(&job.url)?;
+    let host = url.host_str().unwrap_or_default().to_owned();
+    let mut tx = db.begin().await?;
+    let source: Uuid = sqlx::query_scalar(
+        "insert into sources (key, kind, display_name, endpoint, enabled, support)
+         values ($1, 'manual', $2, jsonb_build_object('kind', 'manual', 'url', $3::text), false, 'manual_link')
+         on conflict (key) do update set updated_at = now() returning id",
+    )
+    .bind(format!("owner-entered-{host}"))
+    .bind(format!("Added by you · {host}"))
+    .bind(format!("https://{host}/"))
+    .fetch_one(&mut *tx)
+    .await?;
+    // A link to a posting that discovery already holds tracks that opportunity, not a copy of it.
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "select opportunity_id from postings where (source_id = $1 and native_id = $2) or url = $2
+         order by (source_id = $1) desc limit 1",
+    )
+    .bind(source)
+    .bind(url.as_str())
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    let opportunity = match existing {
+        Some(id) => id,
+        None => {
+            let normalized = opportunity_domain::normalize_organization(employer);
+            if normalized.is_empty() {
+                return Err(AppError::Invalid("Name the employer.".into()));
+            }
+            let org: Uuid = sqlx::query_scalar("insert into organizations (normalized_name, display_name) values ($1, $2) on conflict (normalized_name) do update set updated_at = now() returning id")
+                .bind(normalized).bind(employer).fetch_one(&mut *tx).await?;
+            let id: Uuid = sqlx::query_scalar(
+                "insert into opportunities (organization_id, dedupe_key, canonical_title, kind, advertised_state, search_text, deadline_at)
+                 values ($1, $2, $3, 'other', 'advertised', $3 || ' ' || $4, $5) returning id",
+            )
+            .bind(org)
+            .bind(format!("owner-entered:{url}"))
+            .bind(title)
+            .bind(employer)
+            .bind(job.deadline_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            // Title only: the posting was never read, so nothing here claims to know its contents.
+            sqlx::query("insert into postings (source_id, native_id, opportunity_id, url, title, title_only, content_hash) values ($1, $2, $3, $2, $4, true, $2)")
+                .bind(source).bind(url.as_str()).bind(id).bind(title)
+                .execute(&mut *tx).await?;
+            id
+        }
+    };
+    tx.commit().await?;
+    let tracked: Option<Uuid> =
+        sqlx::query_scalar("select id from applications where opportunity_id = $1")
+            .bind(opportunity)
+            .fetch_optional(db)
+            .await?;
+    if let Some(id) = tracked {
+        return Ok((id, true));
+    }
+    let app = applications::create_application(db, opportunity, Some(selection(db).await?)).await?;
+    let cv: Option<Uuid> = sqlx::query_scalar(
+        "select id from documents where kind='cv' and approved order by created_at desc limit 1",
+    )
+    .fetch_optional(db)
+    .await?;
+    applications::set_status(
+        db,
+        app.id,
+        "unsupported",
+        json!({"reason": "owner_entered"}),
+    )
+    .await?;
+    sqlx::query("update applications set route_reason=$2, cv_document_id=coalesce(cv_document_id, $3) where id=$1")
+        .bind(app.id)
+        .bind(format!("Apply on {host}, then record it here. Nothing is sent from this platform."))
+        .bind(cv)
+        .execute(db)
+        .await?;
+    Ok((app.id, false))
 }
 
 /// Hand an application to the owner: no automation will touch it again, so they are told once.
@@ -935,6 +1150,12 @@ pub fn spawn(db: Db) {
             }
             if let Err(error) = alert_failing_sources(&db).await {
                 tracing::warn!(%error, "source alerts");
+            }
+            if let Err(error) = crate::alerts::queue_new_match_digest(&db).await {
+                tracing::warn!(%error, "new-match digest");
+            }
+            if let Err(error) = crate::alerts::queue_deadline_reminders(&db).await {
+                tracing::warn!(%error, "deadline reminders");
             }
             if let Err(error) = crate::mail::dispatch(&db).await {
                 tracing::warn!(%error,"email delivery");

@@ -39,7 +39,7 @@ it("requires a deliberate employer authorization and displays exact questions",a
 it("labels the blended priority honestly and flags postings that need review",async()=>{
  const job={id:'j2',canonical_title:'PhD position, memory systems',organization:'Example Lab',provider:'academic',source_key:'lab',apply_url:'https://example.test',last_seen_at:'2026-10-25T08:00:00Z',score:81.4,technical:70.2,profile_match:40,career_stage:'PhD position',career_priority:60,eligibility:'needs_review',explanation:'PhD position · Your CV: DRAM',gaps:['No funded vacancy confirmed']};
  vi.stubGlobal('fetch',vi.fn(async(path:string)=>Response.json(path.endsWith('/home')?{...home,jobs:[job],matches:1}:{})));render(<App/>);
- expect(await screen.findByText('Needs review')).toBeDefined();
+ expect((await screen.findAllByText('Needs review')).some(e => e.classList.contains('badge'))).toBe(true);
  expect(screen.getByText('Priority 81 · technical fit 70 · career stage 60 · profile 40')).toBeDefined();
  expect(screen.getByText('No funded vacancy confirmed')).toBeDefined();
  expect(screen.queryByText('Strong fit')).toBeNull();
@@ -60,4 +60,33 @@ it("counts applied from every application, never from the recent page or uncerta
 it("never implies every source is healthy while one keeps failing",async()=>{
  vi.stubGlobal('fetch',vi.fn(async(path:string)=>Response.json(path.endsWith('/home')?{...home,last_updated:'2026-10-27T08:00:00Z',source_health:{enabled:20,failing:2,never_succeeded:0,stale:1,last_success_at:'2026-10-27T08:00:00Z'}}:{})));render(<App/>);
  expect(await screen.findByText(/2 of 20 employer sources keep failing to refresh/)).toBeDefined();
+});
+
+it("records manual application progress and keeps notes after reload without submitting",async()=>{
+ const application={id:'manual1',opportunity_id:'job1',status:'unsupported',notes:'Follow up next week',title:'System Validation Engineer',employer:'Synthetic Employer',url:'https://example.test'};
+ let saved=false;
+ const fetch=vi.fn(async(path:string,init?:RequestInit)=>{
+  if(path==='/api/applications/manual1/tracking'){
+   expect(init?.method).toBe('POST');expect(JSON.parse(String(init?.body))).toEqual({status:'interview',notes:'Call on Tuesday'});
+   saved=true;return Response.json({});
+  }
+  return Response.json(path.endsWith('/home')?{...home,applications:[saved?{...application,status:'interview',notes:'Call on Tuesday'}:application]}:{});
+ });vi.stubGlobal('fetch',fetch);render(<App/>);
+ fireEvent.click(await screen.findByText('Update tracking'));
+ expect((screen.getByLabelText('Application notes') as HTMLTextAreaElement).value).toBe('Follow up next week');
+ fireEvent.change(screen.getByLabelText('Recorded status'),{target:{value:'interview'}});
+ fireEvent.change(screen.getByLabelText('Application notes'),{target:{value:'Call on Tuesday'}});
+ fireEvent.click(screen.getByRole('button',{name:'Save tracking'}));
+ await screen.findByText('Tracking saved. Nothing was submitted.');
+ expect(fetch.mock.calls.some(c=>c[0].includes('/submit')||c[0].includes('/authorize'))).toBe(false);
+ cleanup();render(<App/>);fireEvent.click(await screen.findByText('Update tracking'));
+ expect((screen.getByLabelText('Application notes') as HTMLTextAreaElement).value).toBe('Call on Tuesday');
+ expect((screen.getByLabelText('Recorded status') as HTMLSelectElement).value).toBe('interview');
+});
+it("never shows email from before the upgrade as queued, even with mail configured",async()=>{
+ const apps=[{id:'a1',opportunity_id:'j1',status:'submitted',title:'Engineer',employer:'Example',url:'https://example.test'},{id:'a2',opportunity_id:'j2',status:'submitted',title:'Researcher',employer:'Example',url:'https://example.test'}];
+ vi.stubGlobal('fetch',vi.fn(async(path:string)=>Response.json(path.endsWith('/home')?{...home,email_configured:true,applications:apps,mail:[{application_id:'a1',state:'suppressed'},{application_id:'a2',state:'seen'}]}:{})));render(<App/>);
+ expect(await screen.findByText('Not emailed: from before email delivery')).toBeTruthy();
+ expect(screen.getByText('Seen here; not emailed')).toBeTruthy();
+ expect(screen.queryByText('Email queued')).toBeNull();
 });

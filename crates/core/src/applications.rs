@@ -730,6 +730,7 @@ struct TokenRow {
     id: Uuid,
     payload_hash: String,
     destination: String,
+    source_key: String,
     expires_at: DateTime<Utc>,
     used_at: Option<DateTime<Utc>>,
 }
@@ -770,7 +771,7 @@ pub async fn decide_authorization(
     .await?;
 
     let token_row = sqlx::query_as::<_, TokenRow>(
-        "select id, payload_hash, destination, expires_at, used_at
+        "select id, payload_hash, destination, source_key, expires_at, used_at
          from authorization_tokens where application_id = $1 and used_at is null
          order by created_at desc limit 1",
     )
@@ -822,6 +823,15 @@ pub async fn decide_authorization(
         })
         .collect();
 
+    // A token names the source it was issued under, as well as the destination and payload: spent
+    // under any other source it authorizes nothing.
+    if let Some(row) = token_row.as_ref().filter(|t| t.source_key != source_key) {
+        let reason = format!(
+            "that authorization was issued for the source '{}', not this one",
+            row.source_key
+        );
+        return Ok((Authorization::Refused { reason }, None, None));
+    }
     let token = token_row.as_ref().map(|t| Token {
         payload_hash: t.payload_hash.clone(),
         destination: t.destination.clone(),
@@ -1013,7 +1023,7 @@ pub async fn finish_submission(
     outcome: Outcome<'_>,
 ) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
-    sqlx::query(
+    let recorded = sqlx::query(
         "update application_attempts set state = $3, receipt = $4, diagnostic = $5, evidence = $6, finished_at = now()
          where id = $1 and application_id = $2",
     )
@@ -1024,7 +1034,15 @@ pub async fn finish_submission(
     .bind(outcome.diagnostic)
     .bind(outcome.evidence)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    // Exactly this application's attempt, or nothing: no status, event or notification for an
+    // attempt that does not exist or belongs to another application (the transaction rolls back).
+    if recorded != 1 {
+        return Err(AppError::Invalid(format!(
+            "attempt {attempt_id} does not belong to application {application_id}; nothing was recorded"
+        )));
+    }
     settle(
         &mut tx,
         application_id,

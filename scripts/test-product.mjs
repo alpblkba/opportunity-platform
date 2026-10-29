@@ -70,12 +70,24 @@ try{
  assert.equal(home.ranking_policy,'career-priority-v3');
  const cvId=home.cv.id;
  await page.reload();await page.getByText('synthetic-test-cv.txt').waitFor();assert.equal((await api('/home')).cv.id,cvId);
+ // Owner choices made before the restart must survive it: a saved match, a dismissed one, a blocked employer.
+ const before=await api('/home');assert.ok(before.jobs.length>=3,'the synthetic corpus ranks at least three matches');
+ const keep=before.jobs[0],drop=before.jobs[1],other=before.jobs.find(j=>j.organization!==keep.organization&&j.id!==drop.id);
+ await api(`/home/mark/${keep.id}`,{mark:'saved',on:true});const hidden=await api(`/home/dismiss/${drop.id}`,{});
+ const blocked=other?await api('/home/block-employer',{employer:other.organization}):null;
  app.kill('SIGTERM');await new Promise(r=>app.on('exit',r));app=launch(['serve','--port','8897']);await until(async()=>{try{return(await fetch(appOrigin+'/ready')).ok;}catch{return false;}});
  await page.reload();await page.getByText('synthetic-test-cv.txt').waitFor();home=await api('/home');assert.equal(home.cv.id,cvId);assert.equal(home.selected_profile,memory.id);
+ assert.ok(home.marks.some(m=>m.opportunity_id===keep.id&&m.mark==='saved'),'a saved match survives the restart');
+ assert.ok(!home.jobs.some(j=>j.id===drop.id),'a dismissed match stays dismissed after the restart');
+ assert.ok(home.exclusions.some(r=>r.id===hidden.id&&r.kind==='hidden'));
+ if(blocked){assert.ok(!home.jobs.some(j=>j.organization===other.organization),'a blocked employer stays hidden after the restart');}
+ await page.getByRole('button',{name:'Saved ✓'}).first().waitFor();
+ for(const rule of [hidden,blocked].filter(Boolean))await page.evaluate(id=>fetch('/api/rules/'+id,{method:'DELETE'}),rule.id);
+ assert.ok((await api('/home')).jobs.some(j=>j.id===drop.id),'undoing a dismissal brings the match back');
  // A replacement changes the candidate record and rankings, without asking for manual facts.
  await page.getByLabel('Upload CV',{exact:true}).setInputFiles({name:'synthetic-test-cv-v2.txt',mimeType:'text/plain',buffer:Buffer.from(cv.replace('3 years','4 years'))});
  await page.getByText('CV updated. Your matches now use this version.').waitFor();home=await api('/home');assert.notEqual(home.cv.id,cvId);
- console.log(`PASS landing, login, persistent CV, profile persistence, restart, CV replacement, ${offline?'synthetic':'real'} discovery and career-stage ranking`);
+ console.log(`PASS landing, login, persistent CV, profile persistence, restart, saved/dismissed/blocked choices across the restart, CV replacement, ${offline?'synthetic':'real'} discovery and career-stage ranking`);
  await page.screenshot({path:resolve(out,'ranked-desktop.png'),fullPage:false});
  await page.setViewportSize({width:390,height:844});await page.screenshot({path:resolve(out,'ranked-mobile.png'),fullPage:false});
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);await page.setViewportSize({width:1150,height:950});
