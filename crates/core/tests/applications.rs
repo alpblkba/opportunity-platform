@@ -1587,6 +1587,14 @@ async fn manual_tracking_persists_notes_and_owner_history_without_a_submission_a
         updated.notes.as_deref(),
         Some("Applied on employer website myself")
     );
+    profiles::seed_default_profiles(&db.pool).await.unwrap();
+    let home = opportunity_core::product::dashboard(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        home["applications"][0]["notes"],
+        "Applied on employer website myself"
+    );
     let events = applications::list_events(&db.pool, app.id).await.unwrap();
     let event = events
         .iter()
@@ -2393,5 +2401,89 @@ async fn a_receipt_survives_a_crash_at_any_point_and_is_never_followed_by_anothe
     assert!(applications::queue_for_automation(&db.pool, stuck)
         .await
         .is_err());
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_token_authorizes_only_the_source_it_was_issued_under() {
+    let db = require_db!();
+    let application = application_ready_to_submit(&db.pool, "Firmware Engineer").await;
+    applications::issue_token(
+        &db.pool,
+        application,
+        MOCK_DESTINATION,
+        "example-greenhouse",
+        "payload",
+        5,
+    )
+    .await
+    .unwrap();
+    let mut ctx = context(application, "example-greenhouse", "payload", Route::Review).await;
+    let (decision, _, token) = applications::decide_authorization(&db.pool, &ctx)
+        .await
+        .unwrap();
+    assert!(decision.is_permitted(), "{}", decision.reason());
+    assert!(token.is_some());
+    // Same application, destination and payload, spent under another source: refused.
+    ctx.source_key = "other-source";
+    let (decision, policy, token) = applications::decide_authorization(&db.pool, &ctx)
+        .await
+        .unwrap();
+    assert!(!decision.is_permitted());
+    assert!(
+        decision
+            .reason()
+            .contains("issued for the source 'example-greenhouse'"),
+        "{}",
+        decision.reason()
+    );
+    assert_eq!((policy, token), (None, None));
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn an_outcome_for_another_applications_attempt_records_nothing() {
+    let db = require_db!();
+    let mine = application_ready_to_submit(&db.pool, "Mine").await;
+    let other = application_ready_to_submit(&db.pool, "Other").await;
+    let (attempt, _) = applications::begin_attempt(
+        &db.pool,
+        other,
+        MOCK_DESTINATION,
+        "hash",
+        "token",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    applications::set_status(&db.pool, mine, "submitting", serde_json::json!({}))
+        .await
+        .unwrap();
+    let outcome = || applications::Outcome {
+        attempt_state: "submitted",
+        receipt: Some("receipt"),
+        diagnostic: None,
+        evidence: serde_json::json!({}),
+    };
+    // The attempt exists, but not for this application; and a made-up attempt id does not exist at all.
+    for (application, attempt_id) in [(mine, attempt.id), (mine, Uuid::new_v4())] {
+        let error = applications::finish_submission(&db.pool, application, attempt_id, outcome())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("nothing was recorded"),
+            "{error}"
+        );
+    }
+    assert_eq!(status_of(&db.pool, mine).await, "submitting");
+    let state: String = sqlx::query_scalar("select state from application_attempts where id = $1")
+        .bind(attempt.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "started");
+    assert_eq!(notifications(&db.pool, "submitted").await, 0);
+    assert_eq!(event_count(&db.pool, mine, "status:submitted").await, 0);
     db.cleanup().await;
 }
