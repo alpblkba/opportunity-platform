@@ -35,6 +35,8 @@ RUN mkdir -p crates/domain/src crates/adapters/src crates/core/src crates/api/sr
     && cargo fetch --locked
 COPY crates ./crates
 COPY migrations ./migrations
+# Compiled into the binary (include_str! in crates/core/src/product.rs).
+COPY config/sources.seed.toml ./config/
 RUN cargo build --locked --release --bin opportunity && strip target/release/opportunity
 
 FROM debian:bookworm-slim AS runtime

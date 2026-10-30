@@ -1,21 +1,35 @@
 # What never belongs in a build context.
 #
 # Nothing in the Dockerfile copies these, but the whole context is handed to the daemon before any COPY is evaluated: 13 GB of build output was being sent to build a 176 MB image, and the owner's CV and database dumps were going with it.
+#
+# release-image.sh builds from the reviewed commit's tracked files, so for a release most of this
+# can never be present. It still applies to every other build, and a pattern here is anchored at the
+# context root: `*.key` alone would have let config/server.key through, which is why the secret
+# patterns all start with **/.
 
 # Personal data and local evidence, wherever a component wrote it.
 private/
 **/private/
 backups/
-*.dump
-*.dump.sha256
+**/*.dump
+**/*.dump.sha256
+**/*.pdf
+**/*.docx
+**/*.pages
+**/*.rtf
+**/*.log
 
 # Secrets.
-.env
-.env.*
+**/.env
+**/.env.*
 !.env.example
 !.env.prod.example
-*.pem
-*.key
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+# Short-lived credentials google-github-actions/auth writes into the deploy job's workspace.
+**/gha-creds-*.json
 
 # Downloaded tooling and release archives. 450 MB of gcloud CLI and every image tarball ever built
 # would otherwise be handed to the daemon to build an image that uses none of it.
