@@ -15,6 +15,19 @@
 # Every deploy first runs release-gate.py against what the VM reports it runs. A release that adds
 # migrations is refused unless --migration-rollout names a backup that restore-rehearsal.sh verified.
 #
+# Exit codes of a deploy and of --gate: 0 deployed (or, for --gate, deployable), 10 --gate only:
+# already running, 11 the candidate is no longer master HEAD, 12 the candidate adds migrations,
+# 1 refused before any change or failed and verifiably recovered, 2 unresolved: run --reconcile.
+# A deploy that finds the candidate already running exits 0 and changes nothing.
+#
+# Set by the deploy workflow, and usable by hand:
+#   REQUIRE_CURRENT_HEAD=yes  the gate also requires the candidate to be master HEAD right before
+#                             production changes (asks GitHub through release-candidate.py)
+#   RELEASE_OUTCOME_FILE      appends OUTCOME=... and details for release-candidate.py summary
+#   REMOTE_RUN_AS             run every VM command as this Linux user, through passwordless sudo,
+#                             when the login identity is another one (a CI service account's sa_*
+#                             user under OS Login); files then travel over the command stream
+#
 # Transport is Google's IAP tunnel by default, which needs no public address on the VM and no open
 # firewall: the connection is authorized by IAM and tunnelled over Google's front end. Set
 # TRANSPORT=ssh with SSH_HOST to use an ordinary SSH host instead, which is how this script is
@@ -38,6 +51,11 @@ ARCHIVE=""
 ROLLBACK_TAG=""
 ROLLOUT_DIR=""
 BACKUP_WORK=""
+RUN_AS="${REMOTE_RUN_AS:-}"
+[[ -z "$RUN_AS" || "$RUN_AS" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || { echo 'Unsafe REMOTE_RUN_AS' >&2; exit 2; }
+OUTCOME_FILE="${RELEASE_OUTCOME_FILE:-}"
+OUTCOME=""
+STAGE="starting"
 # What the machine has to be. Taken from the archive's own name when there is one, so a rehearsal on
 # other hardware checks itself honestly rather than being told to skip the check.
 EXPECTED_MACHINE="x86_64"
@@ -77,6 +95,9 @@ remote() {
     printf '  [dry run] run: %s\n' "$command"
     return 0
   fi
+  # As the user who owns REMOTE_DIR and .env.prod, so neither has to be re-owned for a second login
+  # identity. The passwordless sudo is the same one the Docker socket already needs.
+  if [[ -n "$RUN_AS" ]]; then command="sudo -n -u ${RUN_AS} -H bash -c $(printf '%q' "$command")"; fi
   case "$TRANSPORT" in
     iap) gcloud compute ssh "$INSTANCE" --project "$PROJECT" --zone "$ZONE" --tunnel-through-iap --command "$command" ;;
     ssh) ssh "${SSH_HOST:?set SSH_HOST for TRANSPORT=ssh}" "$command" ;;
@@ -91,6 +112,9 @@ copy() {
     printf '  [dry run] copy: %s -> %s\n' "$source" "$destination"
     return 0
   fi
+  # scp would write as the login user into a directory only RUN_AS may enter. A stream cut short is
+  # caught on the VM, which checks the archive's checksum before loading it.
+  if [[ -n "$RUN_AS" ]]; then remote "cat > $(printf '%q' "$destination")" < "$source"; return; fi
   case "$TRANSPORT" in
     iap) gcloud compute scp "$source" "${INSTANCE}:${destination}" --project "$PROJECT" --zone "$ZONE" --tunnel-through-iap ;;
     ssh) scp "$source" "${SSH_HOST:?set SSH_HOST for TRANSPORT=ssh}:${destination}" ;;
@@ -247,6 +271,12 @@ vm_action() {
   case "$result" in 0) LAST_RESULT=0;; 2) LAST_RESULT=2;; *) LAST_RESULT=1;; esac
   return "$LAST_RESULT"
 }
+# One KEY=VALUE per line for the workflow summary; the last OUTCOME written wins.
+report() {
+  OUTCOME="$1"; shift
+  [[ -n "$OUTCOME_FILE" ]] || return 0
+  { printf 'OUTCOME=%s\n' "$OUTCOME"; [[ $# == 0 ]] || printf '%s\n' "$@"; } >> "$OUTCOME_FILE"
+}
 on_exit() {
   local result=$?
   trap - EXIT INT TERM HUP
@@ -255,15 +285,19 @@ on_exit() {
   if [[ "$ACTIVE" == yes && "$result" != 0 ]]; then
     if [[ "$UNCERTAIN" == yes || "$LAST_RESULT" == 2 ]]; then
       echo 'UNRESOLVED RELEASE: preserve the VM journal and run --reconcile; do not retry blindly' >&2
+      report RECOVERY_REQUIRED "STAGE=${STAGE}" ROLLBACK=not-attempted "JOURNAL=${TOKEN}"
       exit 2
     fi
     if vm_action recover; then
       echo 'Release failed; previous image/configuration passed complete recovery checks' >&2
+      report ROLLED_BACK "STAGE=${STAGE}" ROLLBACK=succeeded "JOURNAL=${TOKEN}"
       exit 1
     fi
     echo 'UNRESOLVED RELEASE: recovery could not be proved; database restoration may be required' >&2
+    report RECOVERY_REQUIRED "STAGE=${STAGE}" ROLLBACK=failed "JOURNAL=${TOKEN}"
     exit 2
   fi
+  if [[ "$result" != 0 && "$MODE" == deploy && -z "$OUTCOME" ]]; then report FAILED "STAGE=${STAGE}" CHANGED=no; fi
   exit "$result"
 }
 on_signal() {
@@ -330,24 +364,32 @@ check_transfer() {
   return "$rc"
 }
 
-# Asks the VM what it actually runs and lets release-gate.py decide. 0 deploy, 10 already running,
-# 2 another release is unresolved or still in progress there, anything else refused.
+# Asks the VM what it actually runs and lets release-gate.py decide: 0 deploy, 10 already running,
+# 11 no longer master HEAD, 12 adds migrations, 2 another release is unresolved or still in progress
+# there, anything else refused.
 release_gate() {
-  local status rc=0 state=0
+  local status rc=0 state=0 head=""
   status="$(mktemp)"
   vm_action status > "$status" || state=$?
   UNCERTAIN=no; LAST_RESULT=0
+  # Asked here because in a deploy nothing else runs between this and the first change on the VM.
+  if [[ "${REQUIRE_CURRENT_HEAD:-}" == yes ]]; then
+    head="$(python3 scripts/release-candidate.py master-head)" || { rm -f "$status"; echo 'Cannot read the current master HEAD; refusing' >&2; return 1; }
+  fi
   python3 scripts/release-gate.py --status "$status" --candidate "${REVIEWED_SHA:?set REVIEWED_SHA to the full candidate commit}" \
-    --trusted-ref "${TRUSTED_REF:-origin/master}" ${ROLLOUT_DIR:+--rollout-manifest "$ROLLOUT_DIR"} || rc=$?
+    --trusted-ref "${TRUSTED_REF:-origin/master}" ${ROLLOUT_DIR:+--rollout-manifest "$ROLLOUT_DIR"} \
+    ${head:+--master-head "$head"} ${OUTCOME_FILE:+--outcome-file "$OUTCOME_FILE"} || rc=$?
   rm -f "$status"
-  if [[ "$state" == 2 && "$rc" != 0 ]]; then return 2; fi
+  # A status read that failed cannot vouch for anything, whatever the gate made of it.
+  if [[ "$state" == 2 ]]; then return 2; fi
+  if [[ "$state" != 0 ]]; then return 1; fi
   return "$rc"
 }
 
 case "$MODE" in
   preflight) preflight; exit $? ;;
   check-transfer) check_transfer; exit $? ;;
-  gate) release_gate; exit $? ;;
+  gate) rc=0; release_gate || rc=$?; [[ "$rc" != 2 ]] || report RECOVERY_REQUIRED "STAGE=release gate" CHANGED=no; exit "$rc" ;;
   fetch-backup) fetch_backup; exit $? ;;
   status) vm_action status; exit $? ;;
   reconcile)
@@ -359,6 +401,7 @@ case "$MODE" in
 esac
 
 if [[ "$MODE" == deploy ]]; then
+  STAGE="artifact verification"
   [[ -n "$ARCHIVE" ]] || { echo 'Supply the reviewed image archive' >&2; exit 1; }
   ARTIFACT="$(python3 scripts/release-artifact.py "$ARCHIVE" --revision "${REVIEWED_SHA:-}")"
   read -r TAG IDENTITIES CHECKSUM <<< "$ARTIFACT"
@@ -373,24 +416,37 @@ if [[ "$DRY_RUN" == yes ]]; then
   exit 0
 fi
 if [[ "$MODE" == deploy ]]; then
+  STAGE=preflight
   preflight
+  STAGE="release gate"
   gate=0; release_gate || gate=$?
-  if [[ "$gate" == 10 ]]; then echo "Production already runs ${REVIEWED_SHA}; nothing to deploy."; exit 0; fi
-  [[ "$gate" != 2 ]] || { echo 'Production has an unresolved or in-progress release; this run changed nothing. Use --reconcile.' >&2; exit 2; }
-  [[ "$gate" == 0 ]] || { echo 'The release gate refused this deployment; production was not touched.' >&2; exit 1; }
+  case "$gate" in
+    0) ;;
+    10) OUTCOME=ALREADY_DEPLOYED; echo "Production already runs ${REVIEWED_SHA}; nothing to deploy."; exit 0 ;;
+    11) OUTCOME=SKIPPED_STALE_REVISION; echo "${REVIEWED_SHA} is no longer master HEAD; this run changed nothing."; exit 11 ;;
+    12) OUTCOME=MIGRATION_REQUIRED; echo 'The candidate adds migrations; only the manual --migration-rollout may apply them. Production was not touched.' >&2; exit 12 ;;
+    2) report RECOVERY_REQUIRED "STAGE=release gate" CHANGED=no; echo 'Production has an unresolved or in-progress release; this run changed nothing. Use --reconcile.' >&2; exit 2 ;;
+    *) OUTCOME=REFUSED; echo 'The release gate refused this deployment; production was not touched.' >&2; exit 1 ;;
+  esac
 fi
 ACTIVE=yes
+STAGE=preparing
 vm_action begin "$TAG" "$IDENTITIES" "${REVIEWED_SHA:--}" "$MODE"
 if [[ "$MODE" == deploy ]]; then
+  STAGE=transferring
   INCOMING="${REMOTE_DIR}/.release-state/incoming-${TOKEN}"
   copy "$ARCHIVE" "${INCOMING}/$(basename "$ARCHIVE")"
   copy docker-compose.prod.yml "${INCOMING}/docker-compose.prod.yml"
   copy docker-compose.e2micro.yml "${INCOMING}/docker-compose.e2micro.yml"
   copy scripts/vm-check.sh "${INCOMING}/vm-check.sh"
+  STAGE="loading image"
   vm_action load "$(basename "$ARCHIVE")" "$CHECKSUM"
 fi
+STAGE="starting and verifying the new release"
 vm_action apply
+STAGE="final verification"
 vm_action finish
 ACTIVE=no
+[[ "$MODE" != deploy ]] || report DEPLOYED CHANGED=yes "ROLLBACK_REF=opportunity-app:rollback-${TOKEN}" "JOURNAL=${TOKEN}"
 echo "Verified ${MODE}: ${TAG}. The retained rollback reference and prior configuration are in .release-history/${TOKEN}."
 echo 'No database restore or Cloudflare policy change was performed.'

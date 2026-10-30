@@ -45,7 +45,9 @@ check() {
     (( SECONDS < deadline )) || { echo "Readiness deadline expired (HTTP $code)" >&2; return 1; }
     sleep 1
   done
-  EXPECTED_IMAGE_ID="$expected" timeout 150 sh vm-check.sh
+  # vm-check.sh exits with how many checks failed. That count is not a result code: two failed
+  # checks would otherwise read as 2, "unresolved", and leave a failed release running unrecovered.
+  EXPECTED_IMAGE_ID="$expected" timeout 150 sh vm-check.sh || { local rc=$?; [[ "$rc" == 124 ]] && return 124; return 1; }
 }
 configuration_matches() {
   local outcome="$1" expected file
@@ -142,7 +144,11 @@ case "$ACTION" in
     [[ "$("${D[@]}" image inspect "$tag" --format '{{.Architecture}} {{.Os}}')" == 'amd64 linux' ]]
     [[ "$("${D[@]}" image inspect "$tag" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" == "$(cat "$STATE/revision")" ]]
     [[ "$("${D[@]}" image inspect "$tag" --format '{{index .Config.Labels "org.opencontainers.image.title"}}')" == opportunity-runtime ]]
-    printf '%s\n' "$loaded" > "$STATE/target-id"; phase loaded
+    printf '%s\n' "$loaded" > "$STATE/target-id"
+    # Docker holds the image now. The archive is tens of megabytes that recovery never reads, and
+    # kept in .release-history it would fill this disk one release at a time.
+    printf '%s\n' "$4" > "$STATE/archive-sha256"; rm -f "$STATE/incoming-$TOKEN/$3"
+    phase loaded
     ;;
   apply)
     require_state
@@ -203,10 +209,12 @@ case "$ACTION" in
     running="$("${D[@]}" inspect "$app" --format '{{.Image}}')"
     printf 'Configured image: %s\nRunning immutable image: %s\nActual access mode: %s\n' "$(value APP_IMAGE)" "$running" "$(mode "$app")"
     echo 'No pending release journal'
-    # Machine-readable, for release-gate.py: what actually runs, and SQLx's own record of the schema.
-    printf 'DEPLOYED_REVISION=%s\nDEPLOYED_IMAGE=%s\n' "$("${D[@]}" image inspect "$running" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" "$running"
-    dc exec -T db sh -c 'psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL' | sed 's/^/MIGRATION=/'
-select version || ':' || encode(checksum, 'hex') from _sqlx_migrations where success order by version;
+    # Machine-readable, for release-gate.py: what actually runs, what a restart would run, and SQLx's
+    # own record of the schema, including a migration that failed part-way.
+    configured="$(value APP_IMAGE)"; configured="${configured:-opportunity-app:latest}"
+    printf 'DEPLOYED_REVISION=%s\nDEPLOYED_IMAGE=%s\nCONFIGURED_IMAGE_ID=%s\n' "$("${D[@]}" image inspect "$running" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" "$running" "$(image_id "$configured" 2>/dev/null || true)"
+    dc exec -T db sh -c 'psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+select case when success then 'MIGRATION=' else 'MIGRATION_FAILED=' end || version || ':' || encode(checksum, 'hex') from _sqlx_migrations order by version;
 SQL
     echo MIGRATIONS_END
     ;;
