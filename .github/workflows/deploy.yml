@@ -1,11 +1,14 @@
 name: deploy
 
-# Ships a master commit only after "continuous integration" passed on that exact commit. The
-# existing scripts do the work: release-image.sh builds the reviewed archive, deploy-vm.sh copies it
-# over IAP and runs vm-release.sh (journal lock, retained previous image, health checks, rollback;
-# no database backup, which is why schema changes never deploy from here). Secrets stay in
-# .env.prod on the VM. Inert until the owner completes docs/DEPLOYMENT.md "Automated deployment"
-# and sets the DEPLOY_ENABLED repository variable.
+# Ships the current master HEAD only after "continuous integration" passed on a push of that exact
+# commit. The existing scripts do the work: release-candidate.py checks the run's trigger, master
+# HEAD and CI; release-gate.py (through deploy-vm.sh --gate) checks production's real state;
+# release-image.sh builds the reviewed archive; deploy-vm.sh copies it over IAP and runs
+# vm-release.sh (journal lock, retained previous image, health checks, rollback; no database backup,
+# which is why schema changes never deploy from here). Secrets stay in .env.prod on the VM.
+#
+# Inert until the owner completes docs/RELEASE_OPERATIONS.md and sets the DEPLOY_ENABLED repository
+# variable. Nothing here, and nothing in a test, sets it.
 on:
   workflow_run:
     workflows: [continuous integration]
@@ -13,12 +16,10 @@ on:
     branches: [master]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  actions: read
-  id-token: write
+permissions: {}
 
-# One release at a time; a newer pending run replaces an older pending one.
+# One release at a time; a newer pending run replaces an older pending one. A run that starts after
+# a newer commit landed stops at its own HEAD checks.
 concurrency:
   group: production
   cancel-in-progress: false
@@ -30,55 +31,113 @@ defaults:
 jobs:
   deploy:
     name: Build, deploy and verify
+    # A coarse filter so pull requests, forks and failed CI never start a job that can ask for
+    # credentials. release-candidate.py check is the authority and checks all of it again.
     if: >-
       vars.DEPLOY_ENABLED == 'true' && (
         (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
-        (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_branch == 'master' &&
+         github.event.workflow_run.repository.full_name == github.repository &&
+         github.event.workflow_run.head_repository.full_name == github.repository)
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     environment: production
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     env:
       REVIEWED_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
       GCP_PROJECT: ${{ vars.GCP_PROJECT }}
       GCP_INSTANCE: ${{ vars.GCP_INSTANCE }}
       GCP_ZONE: ${{ vars.GCP_ZONE }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      REMOTE_RUN_AS: ${{ vars.REMOTE_RUN_AS }}
+      REQUIRE_CURRENT_HEAD: 'yes'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.REVIEWED_SHA }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Require the candidate to be on master and green in CI
+      - name: Require complete deploy configuration
+        id: config
+        run: python3 -I scripts/release-candidate.py config
+      # Exact current master HEAD, a successful push CI run on that SHA with every required job.
+      - name: Require the candidate to be master HEAD and green in CI
+        id: candidate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git merge-base --is-ancestor "$REVIEWED_SHA" origin/master || { echo "::error::${REVIEWED_SHA} is not on master"; exit 1; }
-          green="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/hygiene.yml/runs?head_sha=${REVIEWED_SHA}&event=push&status=success" --jq '.total_count')"
-          [[ "$green" -ge 1 ]] || { echo "::error::continuous integration has not passed on ${REVIEWED_SHA}"; exit 1; }
+          rc=0; python3 -I scripts/release-candidate.py check || rc=$?
+          [[ "$rc" == 0 || "$rc" == 11 ]] || exit 1
       # Short-lived credentials through Workload Identity Federation; no service-account key exists.
-      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+      # The credential file it writes into the workspace is ignored by Git, never in the build
+      # context (release-image.sh builds from the commit's tracked files), and removed by its post
+      # step.
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        id: auth
+        if: steps.candidate.outputs.outcome == 'ELIGIBLE'
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        if: steps.auth.outcome == 'success'
       # Compares with what the VM reports it runs (image revision label, SQLx migration checksums),
-      # not with Actions history. A release that adds migrations is always refused here, manual runs
-      # included: it needs a verified backup only the owner's machine holds (docs/DEPLOYMENT.md).
+      # not with Actions history, and asks again whether the candidate is still master HEAD. A
+      # release that adds migrations is always refused here, manual runs included: it needs a
+      # verified backup only the owner's machine holds (docs/RELEASE_OPERATIONS.md).
       - name: Release gate against production's actual state (changes nothing)
         id: gate
+        if: steps.auth.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          rc=0; ./scripts/deploy-vm.sh --gate || rc=$?
-          if [[ "$rc" == 10 ]]; then echo "skip=true" >> "$GITHUB_OUTPUT"; elif [[ "$rc" != 0 ]]; then exit 1; fi
+          rc=0; RELEASE_OUTCOME_FILE="$RUNNER_TEMP/gate.outcome" ./scripts/deploy-vm.sh --gate || rc=$?
+          case "$rc" in
+            0) echo "proceed=true" >> "$GITHUB_OUTPUT" ;;
+            10|11) echo "proceed=false" >> "$GITHUB_OUTPUT" ;;
+            *) exit 1 ;;
+          esac
       - name: Build the reviewed linux/amd64 image archive
-        if: steps.gate.outputs.skip != 'true'
+        id: build
+        if: steps.gate.outputs.proceed == 'true'
         run: ./scripts/release-image.sh
       - name: Preflight against the VM (changes nothing)
-        if: steps.gate.outputs.skip != 'true'
+        id: preflight
+        if: steps.gate.outputs.proceed == 'true'
         run: ./scripts/deploy-vm.sh --preflight "dist/opportunity-app-${REVIEWED_SHA}-amd64.tar.gz"
+      # Gates once more, master HEAD included, immediately before the first change on the VM.
       - name: Deploy with recovery point, health checks and rollback
-        if: steps.gate.outputs.skip != 'true'
-        run: ./scripts/deploy-vm.sh "dist/opportunity-app-${REVIEWED_SHA}-amd64.tar.gz"
-      - name: Report the running release
+        id: deploy
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rc=0; RELEASE_OUTCOME_FILE="$RUNNER_TEMP/deploy.outcome" ./scripts/deploy-vm.sh "dist/opportunity-app-${REVIEWED_SHA}-amd64.tar.gz" || rc=$?
+          [[ "$rc" == 0 || "$rc" == 11 ]] || exit "$rc"
+      - name: Read the running release (changes nothing)
+        if: always() && steps.auth.outcome == 'success'
+        run: ./scripts/deploy-vm.sh --status | tee "$RUNNER_TEMP/status.txt"
+      - name: Summarize
         if: always()
-        run: ./scripts/deploy-vm.sh --status
+        env:
+          STEP_CONFIG: ${{ steps.config.outcome }}
+          STEP_CANDIDATE: ${{ steps.candidate.outcome }}
+          CANDIDATE_RESULT: ${{ steps.candidate.outputs.outcome }}
+          CANDIDATE_REASON: ${{ steps.candidate.outputs.reason }}
+          MASTER_HEAD: ${{ steps.candidate.outputs.master_head }}
+          STEP_AUTH: ${{ steps.auth.outcome }}
+          STEP_GATE: ${{ steps.gate.outcome }}
+          STEP_BUILD: ${{ steps.build.outcome }}
+          STEP_PREFLIGHT: ${{ steps.preflight.outcome }}
+          STEP_DEPLOY: ${{ steps.deploy.outcome }}
+        run: |
+          python3 -I scripts/release-candidate.py summary --status "$RUNNER_TEMP/status.txt" \
+            --gate-outcome "$RUNNER_TEMP/gate.outcome" --deploy-outcome "$RUNNER_TEMP/deploy.outcome" \
+            | tee -a "$GITHUB_STEP_SUMMARY"

@@ -25,6 +25,9 @@
 *.key
 *.p12
 *.pfx
+# Short-lived credentials google-github-actions/auth writes into the deploy job's checkout. Ignored
+# so the build's clean-checkout check judges the reviewed source, not the job's own login.
+gha-creds-*.json
 *.docx
 *.pdf
 *.pages

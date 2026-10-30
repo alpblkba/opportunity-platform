@@ -128,8 +128,10 @@ shutil.copyfile(a[-1], a[a.index('--output') + 1])
         self.assertNotEqual(result.returncode, 0)
 
 # These fixtures execute the real scripts and journal mutations; only Docker/SSH are simulated.
+import importlib.util
 import io
 import json
+import re
 import signal
 import tarfile
 import time
@@ -139,12 +141,12 @@ OLD_ID = "sha256:" + "a" * 64
 NEW_TAG = "opportunity-app:" + SHA + "-amd64"
 
 
-def archive_fixture(root, revision=SHA, tags=None, arch="amd64"):
+def archive_fixture(root, revision=SHA, tags=None, arch="amd64", named=SHA):
     config = json.dumps({"architecture": arch, "os": "linux", "config": {"Labels": {
         "org.opencontainers.image.revision": revision,
         "org.opencontainers.image.title": "opportunity-runtime"}}}).encode()
     identity = "sha256:" + hashlib.sha256(config).hexdigest()
-    path = root / ("opportunity-app-" + SHA + "-amd64.tar.gz")
+    path = root / ("opportunity-app-" + named + "-amd64.tar.gz")
     manifest = json.dumps([{"Config": identity[7:] + ".json", "RepoTags": tags or [NEW_TAG], "Layers": []}]).encode()
     with tarfile.open(path, "w:gz") as out:
         for name, content in [("manifest.json", manifest), (identity[7:] + ".json", config)]:
@@ -169,13 +171,16 @@ if a[0]=='image':
     if f=='{{.Id}}':print(identity)
     elif f=='{{.Architecture}}':print('amd64')
     elif f=='{{.Architecture}} {{.Os}}':print('amd64 linux')
-    elif 'revision' in f:print('b'*40 if identity==s['new_id'] else s.get('old_revision','a'*40))
+    elif 'revision' in f:print(s.get('new_revision','b'*40) if identity==s['new_id'] else s.get('old_revision','a'*40))
     elif 'title' in f:print('opportunity-runtime')
     else:print('1000')
 elif a[0]=='tag':s['images'][a[2]]=image(a[1]);save()
 elif a[0]=='load':
+    if s.get('load_failure'):print('write /var/lib/docker/tmp: no space left on device',file=sys.stderr);sys.exit(1)
     s['images'][s['new_tag']]=('sha256:'+'c'*64) if s.get('wrong_loaded') else s['new_id'];save()
 elif a[0]=='buildx':
+    context=pathlib.Path(a[-1])
+    s['context']={str(f.relative_to(context)):oct(f.stat().st_mode&0o777) for f in context.rglob('*') if f.is_file()}
     s['build_args']=a;s['images'][s['new_tag']]=s['new_id'];save()
 elif a[0]=='save':
     sys.stdout.buffer.write(gzip.decompress(pathlib.Path(s['archive']).read_bytes()))
@@ -186,7 +191,8 @@ elif a[0]=='compose':
         command=a[-1]
         if 'psql -XAt' in command:
             sys.stdin.read()
-            if s.get('migrations'):print('\n'.join(s['migrations']))
+            rows=['MIGRATION='+m for m in s.get('migrations',[])]+['MIGRATION_FAILED='+m for m in s.get('failed_migrations',[])]
+            if rows:print('\n'.join(rows))
             sys.exit(5 if s.get('migration_query_failure') else 0)
         if 'pg_dump' in command:
             sys.stdout.buffer.write(b'not a dump' if s.get('bad_dump') else b'PGDMP'+b'synthetic dump '*64);sys.stdout.flush()
@@ -222,12 +228,13 @@ elif a[0]=='exec':
     elif 'pg_isready' in a:print('accepting connections')
     elif 'curl' in a:
         path=urllib.parse.urlsplit(a[-1]).path
+        new=s['running_id']==s['new_id']
         if '-w' not in a:print('<!doctype html><title>Fixture</title>')
-        elif path=='/health':print(s.get('health','200'))
+        elif path=='/health':print(s.get('health_new','200') if new else s.get('health','200'))
         elif path=='/ready':
             s['ready_calls']=s.get('ready_calls',0)+1;save()
-            print('500' if s['ready_calls']<=s.get('delay',0) else s.get('ready','200'))
-        elif path.startswith('/api/'):print(s.get('private_code','401'))
+            print('500' if s['ready_calls']<=s.get('delay',0) else (s.get('ready_new','200') if new else s.get('ready','200')))
+        elif path.startswith('/api/'):print(s.get('private_new','401') if new else s.get('private_code','401'))
         else:print('401' if s.get('running_mode')=='cloudflare' else '200')
     else:print(s.get('running_mode','cloudflare'))
 elif a[0]=='stats':print('fixture 40MiB / 256MiB')
@@ -235,8 +242,9 @@ elif a[0]=='stats':print('fixture 40MiB / 256MiB')
 MODEL_SSH = r'''#!/usr/bin/env python3
 import json,os,pathlib,subprocess,sys
 p=pathlib.Path(os.environ['MODEL']);command=sys.argv[-1]
+if os.environ.get('SSH_LOG'):open(os.environ['SSH_LOG'],'a').write(command+'\0')
 if 'REMOTE_PROBLEMS=' in command:print('fixture preflight\nREMOTE_PROBLEMS=0');sys.exit(0)
-r=subprocess.run(command,shell=True,stdin=sys.stdin,capture_output=True)
+r=subprocess.run(command,shell=True,executable='/bin/bash',stdin=sys.stdin,capture_output=True)
 s=json.loads(p.read_text())
 if s.get('drop_action') and ('-- '+s['drop_action']+' ') in command:
     s['drop_action']='';p.write_text(json.dumps(s));sys.exit(255)
@@ -251,14 +259,40 @@ if s.get('failed_recovery') and s['running_id']!=s['new_id']:sys.exit(1)
 PY_CHECK
 '''
 
+# Copies like scp, or cuts a release archive short (interrupted) or damages it (corrupted in transit).
+SCP = r'''#!/usr/bin/env python3
+import json,os,pathlib,shutil,sys
+s=json.loads(pathlib.Path(os.environ['MODEL']).read_text());source,destination=sys.argv[-2],sys.argv[-1].split(':',1)[1]
+data=pathlib.Path(source).read_bytes()
+if source.endswith('.tar.gz') and s.get('transfer_failure'):
+    pathlib.Path(destination).write_bytes(data[:len(data)//2]);print('lost connection',file=sys.stderr);sys.exit(1)
+if source.endswith('.tar.gz') and s.get('corrupt_transfer'):
+    pathlib.Path(destination).write_bytes(data[:-7]+b'garbage');sys.exit(0)
+shutil.copy2(source,destination)
+'''
+# GitHub's API as `gh api <path>` sees it, from a JSON file: master HEAD, CI runs, and their jobs.
+FAKE_GH = r'''#!/usr/bin/env python3
+import json,os,sys
+f=json.load(open(os.environ['FAKE_GH']));path=sys.argv[-1]
+if os.environ.get('GH_LOG'):open(os.environ['GH_LOG'],'a').write(path+'\n')
+if f.get('fail'):print('HTTP 502',file=sys.stderr);sys.exit(1)
+if '/git/ref/heads/master' in path:print(json.dumps({'object':{'sha':f['head']}}))
+elif '/actions/workflows/' in path:print(json.dumps({'workflow_runs':f.get('runs',[])}))
+elif '/jobs' in path:print(json.dumps({'jobs':f.get('jobs',{}).get(path.split('/runs/')[1].split('/')[0],[])}))
+else:sys.exit(1)
+'''
+FAKE_SUDO = '#!/bin/sh\n[ "$1" = -n ] && [ "$2" = -u ] && [ "$4" = -H ] || exit 64\nprintf "%s\\n" "$3" >> "$SUDO_LOG"\nshift 4\nexec "$@"\n'
+
 
 class DeploymentTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = pathlib.Path(self.tmp.name); self.vm = self.root / "vm"
         for name in ["scripts", "bin", "vm"]: (self.root / name).mkdir()
-        for name in ["deploy-vm.sh", "vm-release.sh", "release-artifact.py", "release-image.sh", "release-gate.py", "backup-stream.py"]:
+        for name in ["deploy-vm.sh", "vm-release.sh", "release-artifact.py", "release-image.sh", "release-gate.py", "backup-stream.py",
+                     "image-check.sh", "release-candidate.py"]:
             shutil.copy2(BASE / "scripts" / name, self.root / "scripts" / name)
+        (self.root / "tree").mkdir(); (self.root / "tree/Dockerfile").write_text("FROM scratch\n")
         self.archive, self.new_id = archive_fixture(self.root)
         self.state = {"images": {"fixture:old": OLD_ID}, "running_tag": "fixture:old", "running_id": OLD_ID,
                       "running_mode": "cloudflare", "configured": "cloudflare", "new_tag": NEW_TAG,
@@ -266,11 +300,14 @@ class DeploymentTests(unittest.TestCase):
         self.state_path = self.root / "state.json"; self.write_state()
         self.env = dict(os.environ, PATH=str(self.root / "bin") + os.pathsep + os.environ["PATH"],
                         MODEL=str(self.state_path), TRANSPORT="ssh", SSH_HOST="fixture.invalid",
-                        REMOTE_DIR=str(self.vm), REVIEWED_SHA=SHA, VM_READY_TIMEOUT="1", PLATFORM="linux/amd64", TARGET="runtime", VERSION=SHA, DIRTY="")
-        self.env.pop("APP_IMAGE", None)
+                        REMOTE_DIR=str(self.vm), REVIEWED_SHA=SHA, VM_READY_TIMEOUT="1", PLATFORM="linux/amd64", TARGET="runtime", VERSION=SHA, DIRTY="",
+                        FIXTURE_TREE=str(self.root / "tree"), GITHUB_REPOSITORY="fixture/opportunity-platform",
+                        FAKE_GH=str(self.root / "gh.json"), SUDO_LOG=str(self.root / "sudo.log"))
+        for key in ("APP_IMAGE", "REQUIRE_CURRENT_HEAD", "RELEASE_OUTCOME_FILE", "REMOTE_RUN_AS", "SSH_LOG"): self.env.pop(key, None)
+        (self.root / "gh.json").write_text(json.dumps({"head": SHA}))
         commands = {"docker": MODEL_DOCKER, "ssh": MODEL_SSH,
-                    "scp": '#!/usr/bin/env python3\nimport shutil,sys\nshutil.copy2(sys.argv[-2],sys.argv[-1].split(":",1)[1])\n',
-                    "git": '#!/bin/sh\ncase "$*" in *rev-parse*) printf "'+SHA+'\\n";; *status*) printf "%s" "${DIRTY:-}";; esac\n',
+                    "scp": SCP, "gh": FAKE_GH, "sudo": FAKE_SUDO,
+                    "git": '#!/bin/sh\ncase "$*" in *archive*) tar -cf - -C "$FIXTURE_TREE" .;; *rev-parse*) printf "'+SHA+'\\n";; *status*) printf "%s" "${DIRTY:-}";; esac\n',
                     "shasum": '#!/usr/bin/env python3\nimport hashlib,pathlib,sys\np=pathlib.Path(sys.argv[-1]);print(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+str(p))\n',
                     "systemctl": '#!/bin/sh\nexit 3\n', "dmesg": '#!/bin/sh\nexit 1\n',
                     "free": '#!/bin/sh\nprintf "Mem: 1024 200 100 0 0 800\\nSwap: 0 0 0\\n"\n',
@@ -303,6 +340,77 @@ class DeploymentTests(unittest.TestCase):
         history=next((self.vm/'.release-history').iterdir());self.assertEqual((history/'previous-id').read_text().strip(),OLD_ID)
         self.assertEqual(s['images'][(history/'rollback-ref').read_text().strip()],OLD_ID)
 
+    def outcome(self, **flags):
+        self.flags(**flags); path = self.root / "deploy.outcome"; path.unlink(missing_ok=True)
+        r = self.invoke(RELEASE_OUTCOME_FILE=str(path))
+        fields = {}
+        for line in path.read_text().splitlines() if path.exists() else []:
+            key, _, value = line.partition("="); fields[key] = value
+        return r, fields
+    def test_success_reports_deployed_and_keeps_no_archive_in_history(self):
+        r, fields = self.outcome(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(fields["OUTCOME"], "DEPLOYED"); self.assertEqual(fields["RELEASE_TYPE"], "code-only")
+        self.assertEqual(fields["PREVIOUS_REVISION"], "a" * 40); self.assertTrue(fields["ROLLBACK_REF"].startswith("opportunity-app:rollback-"))
+        history = next((self.vm / ".release-history").iterdir())
+        self.assertEqual(list(history.rglob("*.tar.gz")), [])
+        self.assertEqual((history / "archive-sha256").read_text().split()[0], self.archive.with_name(self.archive.name + ".sha256").read_text().split()[0])
+    def test_corrupted_transfer_is_caught_on_the_vm_and_rolled_back(self):
+        r, fields = self.outcome(corrupt_transfer=True); self.assert_recovered(r)
+        self.assertNotIn(NEW_TAG, json.loads(self.state_path.read_text())["images"])
+        self.assertEqual((fields["OUTCOME"], fields["ROLLBACK"], fields["STAGE"]), ("ROLLED_BACK", "succeeded", "loading image"))
+    def test_interrupted_transfer_is_rolled_back(self):
+        r, fields = self.outcome(transfer_failure=True); self.assert_recovered(r)
+        self.assertEqual((fields["OUTCOME"], fields["STAGE"]), ("ROLLED_BACK", "transferring"))
+    def test_failed_load_such_as_a_full_disk_is_rolled_back(self):
+        r, fields = self.outcome(load_failure=True); self.assert_recovered(r)
+        self.assertNotIn(NEW_TAG, json.loads(self.state_path.read_text())["images"]); self.assertEqual(fields["STAGE"], "loading image")
+    def test_new_release_that_never_becomes_ready_is_rolled_back(self):
+        r, fields = self.outcome(ready_new="500"); self.assert_recovered(r)
+        self.assertEqual(fields["STAGE"], "starting and verifying the new release"); self.assertIn("Readiness deadline expired", r.stderr)
+    def real_checker(self):
+        for directory in (self.root / "scripts", self.vm): shutil.copy2(BASE / "scripts/vm-check.sh", directory / "vm-check.sh")
+        (self.vm / ".env.prod").write_text("APP_IMAGE=fixture:old\nACCESS_MODE=cloudflare\nPOSTGRES_USER=fixture\nPOSTGRES_DB=fixture\n"
+                                           + "".join(k + "=synthetic\n" for k in ["POSTGRES_PASSWORD", "CF_ACCESS_TEAM_DOMAIN", "CF_ACCESS_AUD", "ACCESS_ALLOWED_EMAILS", "CLOUDFLARE_TUNNEL_TOKEN"]))
+        (self.vm / ".env.prod").chmod(0o600)
+    def test_real_checker_passes_a_healthy_release(self):
+        self.real_checker(); r, fields = self.outcome(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr); self.assertEqual(fields["OUTCOME"], "DEPLOYED")
+    def assert_really_recovered(self, r, fields, failure):
+        # The real checker failed the new release, then passed the restored one in full.
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr); self.assertEqual(fields["OUTCOME"], "ROLLED_BACK")
+        s = json.loads(self.state_path.read_text()); self.assertEqual(s["running_id"], OLD_ID); self.assertFalse((self.vm / ".release-state").exists())
+        output = r.stdout + r.stderr
+        self.assertIn(failure, output); self.assertIn("All checks passed.", output.split(failure, 1)[1])
+    def test_real_checker_rolls_back_a_release_whose_health_fails(self):
+        # Exactly two failed checks: a count that used to be read as "unresolved" and left it running.
+        self.real_checker(); r, fields = self.outcome(health_new="503")
+        self.assertIn("2 check(s) failed.", r.stdout); self.assert_really_recovered(r, fields, "/health answered 503")
+    def test_real_checker_rolls_back_a_release_that_serves_private_data_anonymously(self):
+        self.real_checker(); r, fields = self.outcome(private_new="200")
+        self.assert_really_recovered(r, fields, "/api/stats answered 200 to an unauthenticated caller")
+    def test_unprovable_recovery_reports_recovery_required(self):
+        r, fields = self.outcome(failed_check=True, failed_recovery=True); self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual((fields["OUTCOME"], fields["ROLLBACK"]), ("RECOVERY_REQUIRED", "failed"))
+        r, fields = self.outcome(failed_check=False, failed_recovery=False); self.assertEqual(r.returncode, 2)
+        self.assertEqual(fields["OUTCOME"], "RECOVERY_REQUIRED"); self.assertEqual(fields["CHANGED"], "no")
+    def test_lost_transport_reports_recovery_required_without_rollback(self):
+        r, fields = self.outcome(drop_action="apply"); self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual((fields["OUTCOME"], fields["ROLLBACK"]), ("RECOVERY_REQUIRED", "not-attempted"))
+    def test_failure_before_any_change_is_reported_as_such(self):
+        path = self.root / "deploy.outcome"
+        r = self.invoke(str(self.archive), RELEASE_OUTCOME_FILE=str(path), REVIEWED_SHA="a" * 40); self.assertEqual(r.returncode, 1)
+        self.assertIn("OUTCOME=FAILED", path.read_text()); self.assertIn("STAGE=artifact verification", path.read_text()); self.assertIn("CHANGED=no", path.read_text())
+        self.assertFalse((self.vm / ".release-state").exists())
+    def test_commands_run_as_the_owning_user_and_files_travel_over_the_stream(self):
+        ssh_log = self.root / "ssh.log"
+        r = self.invoke(REMOTE_RUN_AS="fixture_owner", SSH_LOG=str(ssh_log)); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        commands = [c for c in ssh_log.read_text().split("\0") if c]
+        self.assertTrue(commands); self.assertTrue(all(c.startswith("sudo -n -u fixture_owner -H bash -c ") for c in commands), commands[:3])
+        self.assertEqual(set((self.root / "sudo.log").read_text().split()), {"fixture_owner"})
+        self.assertEqual(json.loads(self.state_path.read_text())["running_id"], self.new_id)
+    def test_unsafe_run_as_user_is_refused_before_contact(self):
+        ssh_log = self.root / "ssh.log"
+        for user in ("root;id", "-u0", "Owner"):
+            r = self.invoke(REMOTE_RUN_AS=user, SSH_LOG=str(ssh_log)); self.assertEqual(r.returncode, 2, user); self.assertFalse(ssh_log.exists())
     def test_failed_start_restores_prior_config_and_full_check(self):
         (self.root/'docker-compose.prod.yml').write_text('changed release configuration\n')
         self.flags(compose_failure=True);self.assert_recovered(self.invoke())
@@ -420,6 +528,8 @@ class DeploymentTests(unittest.TestCase):
                            env=self.env, capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0, r.stdout+r.stderr)
         self.assertNotIn('ready to ship:', r.stdout)
+        # Nothing named like a release, or half of one, is left behind.
+        self.assertEqual(sorted(p.name for p in (self.root / 'dist').iterdir()), [])
     def test_build_is_amd64_runtime_labeled_and_archive_verified(self):
         r=subprocess.run(['bash','scripts/release-image.sh'],cwd=self.root,env=self.env,capture_output=True,text=True)
         self.assertEqual(r.returncode,0,r.stdout+r.stderr)
@@ -498,7 +608,7 @@ class GateTests(unittest.TestCase):
     def status(self, revision, migrations=None, extra=""):
         migrations = self.checksums(revision) if migrations is None else migrations
         lines = ["Configured image: opportunity-app:fixture", "No pending release journal", f"DEPLOYED_REVISION={revision}",
-                 "DEPLOYED_IMAGE=sha256:" + "e" * 64] + [f"MIGRATION={v}:{c}" for v, c in sorted(migrations.items())] + ["MIGRATIONS_END"]
+                 "DEPLOYED_IMAGE=sha256:" + "e" * 64, "CONFIGURED_IMAGE_ID=sha256:" + "e" * 64] + [f"MIGRATION={v}:{c}" for v, c in sorted(migrations.items())] + ["MIGRATIONS_END"]
         return extra + "\n".join(lines) + "\n"
     def gate(self, candidate, status, *extra):
         self.git("checkout", "-q", candidate)
@@ -513,7 +623,25 @@ class GateTests(unittest.TestCase):
     def test_repeated_trigger_for_the_running_revision_is_a_no_op(self):
         self.assertEqual(self.gate(self.B, self.status(self.B)).returncode, 10)
     def test_new_migration_is_never_automatic(self):
-        self.assert_refused(self.gate(self.C, self.status(self.B)), "schema change (0002_more.sql)")
+        outcome = pathlib.Path(self.tmp.name) / "gate.outcome"
+        r = self.gate(self.C, self.status(self.B), "--outcome-file", str(outcome))
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr); self.assertIn("MIGRATION_REQUIRED: schema change (0002_more.sql)", r.stdout)
+        self.assertIn("OUTCOME=MIGRATION_REQUIRED", outcome.read_text()); self.assertIn("PENDING_MIGRATIONS=0002_more.sql", outcome.read_text())
+        self.assertIn(f"PREVIOUS_REVISION={self.B}", outcome.read_text())
+    def test_candidate_that_is_no_longer_master_head_is_skipped(self):
+        outcome = pathlib.Path(self.tmp.name) / "gate.outcome"
+        r = self.gate(self.B, self.status(self.A), "--master-head", self.C, "--outcome-file", str(outcome))
+        self.assertEqual(r.returncode, 11, r.stdout); self.assertIn("SKIPPED_STALE_REVISION", r.stdout)
+        self.assertIn("OUTCOME=SKIPPED_STALE_REVISION", outcome.read_text())
+        self.assertEqual(self.gate(self.B, self.status(self.A), "--master-head", self.B).returncode, 0)
+        self.assert_refused(self.gate(self.B, self.status(self.A), "--master-head", "HEAD"), "full commit SHA")
+    def test_failed_migration_on_production_is_refused(self):
+        status = self.status(self.B).replace("MIGRATIONS_END", "MIGRATION_FAILED=2:" + "0" * 96 + "\nMIGRATIONS_END")
+        self.assert_refused(self.gate(self.B, status), "failed migration (2)")
+    def test_running_image_that_is_not_the_configured_one_is_refused(self):
+        status = self.status(self.A).replace("CONFIGURED_IMAGE_ID=sha256:" + "e" * 64, "CONFIGURED_IMAGE_ID=sha256:" + "d" * 64)
+        self.assert_refused(self.gate(self.B, status), "out-of-band change")
+        self.assert_refused(self.gate(self.B, self.status(self.A).replace("CONFIGURED_IMAGE_ID=sha256:" + "e" * 64 + "\n", "")), "out-of-band change")
     def test_migration_edited_after_production_applied_it(self):
         self.assert_refused(self.gate(self.D, self.status(self.C)), "0001_base.sql changed after production applied it")
     def test_out_of_band_build_production_runs_is_refused(self):
@@ -562,7 +690,8 @@ class GateTests(unittest.TestCase):
         for point, reason in [(self.recovery_point(self.B, verified=False), "restore-rehearsal"),
                               (self.recovery_point(self.B, age_hours=30), "older than 24 hours"),
                               (self.recovery_point(self.A), "different production revision"),
-                              (self.recovery_point(self.B, tamper=True), "does not match its manifest")]:
+                              (self.recovery_point(self.B, tamper=True), "does not match its manifest"),
+                              (pathlib.Path(self.tmp.name) / "no-such-backup", "no readable backup manifest")]:
             self.assert_refused(self.gate(self.C, self.status(self.B), "--rollout-manifest", str(point)), reason)
 
 
@@ -578,11 +707,33 @@ class DeployGateTests(unittest.TestCase):
         self.flags(old_revision=SHA); r = self.invoke(); self.assert_untouched(r, 0); self.assertIn("already runs", r.stdout)
     def test_schema_change_is_refused_before_any_mutation(self):
         (self.root / "migrations").mkdir(); (self.root / "migrations/0001_new.sql").write_text("select 1;\n")
-        r = self.invoke(); self.assert_untouched(r, 1); self.assertIn("schema change", r.stdout)
+        outcome = self.root / "deploy.outcome"
+        r = self.invoke(RELEASE_OUTCOME_FILE=str(outcome)); self.assert_untouched(r, 12); self.assertIn("schema change", r.stdout)
+        self.assertIn("OUTCOME=MIGRATION_REQUIRED", outcome.read_text()); self.assertIn("PENDING_MIGRATIONS=0001_new.sql", outcome.read_text())
     def test_applied_migration_missing_from_candidate_is_refused(self):
         self.flags(migrations=["1:" + "0" * 96]); r = self.invoke(); self.assert_untouched(r, 1); self.assertIn("lacks", r.stdout)
     def test_unreadable_migration_history_is_refused(self):
         self.flags(migration_query_failure=True); r = self.invoke(); self.assert_untouched(r, 1)
+    def test_failed_migration_record_is_refused(self):
+        self.flags(failed_migrations=["1:" + "0" * 96]); r = self.invoke(); self.assert_untouched(r, 1); self.assertIn("failed migration", r.stdout)
+    def test_out_of_band_configured_image_is_refused(self):
+        self.state["images"]["fixture:other"] = "sha256:" + "9" * 64; self.write_state()
+        (self.vm / ".env.prod").write_text("APP_IMAGE=fixture:other\nACCESS_MODE=cloudflare\nPOSTGRES_PASSWORD=synthetic-only\n")
+        r = self.invoke(); self.assertEqual(r.returncode, 1, r.stdout + r.stderr); self.assertIn("out-of-band", r.stdout)
+        s = json.loads(self.state_path.read_text()); self.assertEqual(s["running_id"], OLD_ID); self.assertEqual(s["checks"], [])
+        self.assertFalse((self.vm / ".release-state").exists())
+    def test_a_newer_master_head_stops_the_release_before_any_change(self):
+        outcome = self.root / "deploy.outcome"
+        (self.root / "gh.json").write_text(json.dumps({"head": "c" * 40}))
+        r = self.invoke(REQUIRE_CURRENT_HEAD="yes", RELEASE_OUTCOME_FILE=str(outcome)); self.assert_untouched(r, 11)
+        self.assertIn("no longer master HEAD", r.stdout); self.assertIn("OUTCOME=SKIPPED_STALE_REVISION", outcome.read_text())
+        (self.root / "gh.json").write_text(json.dumps({"head": SHA, "fail": True}))
+        self.assert_untouched(self.invoke(REQUIRE_CURRENT_HEAD="yes"), 1)
+    def test_current_master_head_is_checked_and_deploys(self):
+        log = self.root / "gh.log"
+        r = self.invoke(REQUIRE_CURRENT_HEAD="yes", GH_LOG=str(log)); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("/git/ref/heads/master", log.read_text())
+        self.assertEqual(json.loads(self.state_path.read_text())["running_id"], self.new_id)
     def test_unresolved_journal_refuses_with_unresolved_status(self):
         (self.vm / ".release-state").mkdir(); (self.vm / ".release-state/token").write_text("t\n"); (self.vm / ".release-state/phase").write_text("started\n")
         r = self.invoke(); self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
@@ -689,6 +840,366 @@ class BackupTests(unittest.TestCase):
         self.assertEqual((verified["ok"], verified["documents_checked"], verified["documents_missing"]), (True, 1, 0))
         self.assertEqual(verified["manifest_sha256"], hashlib.sha256((directory / "manifest.json").read_bytes()).hexdigest())
         (work / "migrations.txt").write_text("1:" + "b" * 96 + "\n"); self.assertNotEqual(attest().returncode, 0)
+
+
+MARKER = "SYNTHETIC-CREDENTIAL-NOT-A-SECRET"
+
+
+class ReleaseImageTests(unittest.TestCase):
+    """release-image.sh in a real Git checkout, with Docker simulated: what makes it refuse, and what
+    the build is handed. google-github-actions/auth writes gha-creds-*.json into this checkout."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name); self.repo = self.root / "repo"
+        (self.repo / "scripts").mkdir(parents=True); (self.repo / "config").mkdir(); (self.root / "bin").mkdir()
+        for name in ("release-image.sh", "release-artifact.py", "image-check.sh"): shutil.copy2(BASE / "scripts" / name, self.repo / "scripts" / name)
+        for name in (".gitignore", ".dockerignore", "Dockerfile"): shutil.copy2(BASE / name, self.repo / name)
+        (self.repo / "config/app.toml").write_text("synthetic = true\n")
+        self.git("init", "-q", "-b", "master"); self.commit("fixture")
+        (self.root / "bin/docker").write_text(MODEL_DOCKER); (self.root / "bin/docker").chmod(0o755)
+        self.state_path = self.root / "state.json"
+        self.env = dict(os.environ, PATH=str(self.root / "bin") + os.pathsep + os.environ["PATH"], MODEL=str(self.state_path),
+                        TMPDIR=str(self.root), PLATFORM="linux/amd64", TARGET="runtime")
+        for key in ("VERSION", "RELEASE_DIR"): self.env.pop(key, None)
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "-C", str(self.repo), *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
+    def commit(self, message):
+        self.git("add", "-A"); self.git("commit", "-q", "-m", message); self.sha = self.git("rev-parse", "HEAD")
+        tag = f"opportunity-app:{self.sha}-amd64"
+        (self.root / "fixture").mkdir(exist_ok=True)
+        archive, identity = archive_fixture(self.root / "fixture", revision=self.sha, tags=[tag], named=self.sha)
+        self.state = {"images": {}, "new_tag": tag, "new_id": identity, "new_revision": self.sha, "archive": str(archive)}
+        if hasattr(self, "state_path"): self.state_path.write_text(json.dumps(self.state))
+    def build(self, **env):
+        self.state_path.write_text(json.dumps(self.state))
+        return subprocess.run(["bash", "scripts/release-image.sh"], cwd=self.repo, env=dict(self.env, **{"REVIEWED_SHA": self.sha, **env}),
+                              capture_output=True, text=True, timeout=60)
+    def plant(self, path, content=MARKER):
+        target = self.repo / path; target.parent.mkdir(parents=True, exist_ok=True); target.write_text(content); return target
+    def built(self): return json.loads(self.state_path.read_text())
+    def assert_refused(self, r, reason):
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr); self.assertIn(reason, r.stderr)
+        self.assertNotIn("build_args", self.built()); self.assertFalse((self.repo / "dist").exists())
+
+    def test_deploy_credential_neither_dirties_the_checkout_nor_reaches_the_build(self):
+        self.plant("gha-creds-0123456789abcdef.json", json.dumps({"type": "external_account", "marker": MARKER}))
+        r = self.build(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        context = self.built()["context"]
+        self.assertIn("Dockerfile", context); self.assertIn("config/app.toml", context)
+        self.assertFalse([name for name in context if "gha-creds" in name])
+        self.assertNotIn(MARKER, r.stdout + r.stderr)
+        self.assertTrue((self.repo / "dist" / f"opportunity-app-{self.sha}-amd64.tar.gz").exists())
+        # The extracted context and the build lock are gone again.
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith("opportunity-")], [])
+    def test_ignored_local_secrets_never_reach_the_build_either(self):
+        for path in (".env.prod", "config/server.key", "config/.env.prod", "private/cv.pdf", "config/gha-creds-nested.json"): self.plant(path)
+        r = self.build(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sorted(self.built()["context"]), sorted(self.git("ls-files").splitlines()))
+    def test_context_files_keep_the_modes_a_checkout_has(self):
+        r = self.build(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        context = self.built()["context"]
+        self.assertEqual(context["config/app.toml"], "0o644"); self.assertEqual(context["scripts/release-image.sh"], "0o755")
+    def test_unexpected_untracked_source_still_refuses(self):
+        self.plant("config/stray.toml", "unreviewed = true\n"); self.assert_refused(self.build(), "clean reviewed checkout")
+    def test_modified_tracked_file_still_refuses(self):
+        self.plant("config/app.toml", "synthetic = false\n"); self.assert_refused(self.build(), "clean reviewed checkout")
+    def test_wrong_or_abbreviated_reviewed_sha_still_refuses(self):
+        for sha in ("a" * 40, self.sha[:12], ""):
+            with self.subTest(sha=sha): self.assert_refused(self.build(REVIEWED_SHA=sha), "complete reviewed HEAD")
+    def test_without_the_ignore_rule_the_credential_would_block_every_release(self):
+        ignore = self.repo / ".gitignore"
+        ignore.write_text("".join(l for l in ignore.read_text().splitlines(keepends=True) if "gha-creds" not in l)); self.commit("drop rule")
+        self.plant("gha-creds-0123456789abcdef.json"); self.assert_refused(self.build(), "clean reviewed checkout")
+    def test_a_tracked_credential_is_refused_before_the_daemon_sees_it(self):
+        self.plant("config/gha-creds-0123456789abcdef.json"); self.git("add", "-f", "config/gha-creds-0123456789abcdef.json"); self.commit("credential")
+        self.assert_refused(self.build(), "tracks a deploy credential")
+    def test_interrupted_packaging_leaves_nothing_named_like_a_release(self):
+        self.state["save_failure"] = True
+        r = self.build(); self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sorted(p.name for p in (self.repo / "dist").iterdir()), [])
+
+
+def require_docker(test):
+    if shutil.which("docker") and subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+        return
+    if os.environ.get("CI"):
+        test.fail("CI must run the real build-context and image-content checks; Docker is not available")
+    test.skipTest("Docker is not available here; CI runs this")
+
+
+class ContainerContentTests(unittest.TestCase):
+    """Real BuildKit and a real container: the patterns and the image check do what they claim."""
+    IMAGE = os.environ.get("RELEASE_TEST_IMAGE", "postgres:16-alpine")
+    def setUp(self):
+        require_docker(self)
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup); self.root = pathlib.Path(self.tmp.name)
+    def test_dockerignore_keeps_planted_secrets_out_of_a_real_build_context(self):
+        context = self.root / "context"; context.mkdir(); shutil.copy2(BASE / ".dockerignore", context / ".dockerignore")
+        kept = ["Dockerfile", "Cargo.toml", "crates/core/src/lib.rs", "config/app.toml", "migrations/0001_base.sql",
+                "apps/web/src/main.ts", "apps/web/package.json", ".env.example", ".env.prod.example"]
+        excluded = ["gha-creds-0123abcd.json", "config/gha-creds-0123abcd.json", "apps/web/gha-creds-0123abcd.json",
+                    ".env", ".env.prod", "config/.env.prod", "apps/web/.env.local", "config/server.key", "apps/web/cert.pem",
+                    "crates/core/client.p12", "config/client.pfx", "private/documents/cv.pdf", "apps/browser-worker/private/browser/form.png",
+                    "backups/database.dump", "crates/core/old.dump", "config/cv.docx", "apps/web/session.log", "dist/old.tar.gz"]
+        for name in kept + excluded:
+            (context / name).parent.mkdir(parents=True, exist_ok=True); (context / name).write_text(MARKER)
+        probe = self.root / "probe"; probe.mkdir(); (probe / "Dockerfile").write_text("FROM scratch\nCOPY . /context/\n")
+        out = self.root / "out"
+        r = subprocess.run(["docker", "buildx", "build", "--quiet", "--output", f"type=local,dest={out}", "-f", str(probe / "Dockerfile"), str(context)],
+                           capture_output=True, text=True, timeout=180)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        shipped = {str(p.relative_to(out / "context")) for p in (out / "context").rglob("*") if p.is_file()}
+        self.assertEqual(sorted(set(kept) - shipped), []); self.assertEqual(sorted(set(excluded) & shipped), [])
+        self.assertNotIn(MARKER, r.stdout + r.stderr)
+    def check_image(self, plant=None):
+        setup = ("mkdir -p /app/apps/web/dist /app/config /app/private/browser && touch /app/apps/web/dist/index.html"
+                 " && printf '#!/bin/sh\\necho opportunity fixture\\n' > /usr/local/bin/opportunity && chmod 755 /usr/local/bin/opportunity")
+        if plant:
+            setup += f" && mkdir -p $(dirname {plant}) && echo {MARKER} > {plant}"
+        with open(BASE / "scripts/image-check.sh") as script:
+            return subprocess.run(["docker", "run", "--rm", "-i", "--network", "none", "--user", "0", "--entrypoint", "sh", self.IMAGE,
+                                   "-c", setup + " && exec sh -s"], stdin=script, capture_output=True, text=True, timeout=120)
+    def test_image_check_fails_any_image_carrying_a_planted_secret(self):
+        r = self.check_image(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr); self.assertIn("image contents checked", r.stdout)
+        for plant in ("/app/config/gha-creds-0123abcd.json", "/root/gha-creds-0123abcd.json", "/app/.env.prod", "/opt/.env",
+                      "/app/config/server.key", "/app/config/server.pem", "/app/private/documents/cv.pdf", "/var/backup.dump", "/app/session.log"):
+            with self.subTest(plant=plant):
+                r = self.check_image(plant); self.assertNotEqual(r.returncode, 0, r.stdout)
+                self.assertIn(plant, r.stderr); self.assertNotIn(MARKER, r.stdout + r.stderr)
+        # The base image's own certificate bundle is not a leak.
+        self.assertEqual(self.check_image("/etc/ssl/certs/fixture-ca.pem").returncode, 0)
+
+
+REPO = "fixture-owner/opportunity-platform"
+JOBS = ["Repository security and privacy", "Rust checks with PostgreSQL", "Product acceptance journey", "Frontend validation", "Browser-worker validation"]
+
+
+class CandidateTests(unittest.TestCase):
+    """release-candidate.py check: which triggers, HEADs and CI results may reach production."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name); self.repo = self.root / "repo"; self.repo.mkdir(); (self.root / "bin").mkdir()
+        git = lambda *a: subprocess.run(["git", "-c", "user.name=f", "-c", "user.email=f@example.test", "-C", str(self.repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "master"); (self.repo / "a").write_text("a\n"); git("add", "-A"); git("commit", "-q", "-m", "a")
+        self.sha = git("rev-parse", "HEAD")
+        (self.root / "bin/gh").write_text(FAKE_GH); (self.root / "bin/gh").chmod(0o755)
+        self.api = {"head": self.sha, "runs": [self.ci_run(41)], "jobs": {"41": [{"name": n, "conclusion": "success"} for n in JOBS]}}
+        self.event = {"workflow_run": self.ci_run(41)}
+    def ci_run(self, run_id, **changes):
+        run = {"id": run_id, "head_sha": self.sha, "event": "push", "head_branch": "master", "status": "completed", "conclusion": "success",
+               "path": ".github/workflows/hygiene.yml", "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO}}
+        run.update(changes); return run
+    def check(self, event_name="workflow_run", **env):
+        (self.root / "gh.json").write_text(json.dumps(self.api)); (self.root / "event.json").write_text(json.dumps(self.event))
+        output = self.root / "github_output"; output.write_text("")
+        full = dict(os.environ, PATH=str(self.root / "bin") + os.pathsep + os.environ["PATH"], FAKE_GH=str(self.root / "gh.json"),
+                    GITHUB_REPOSITORY=REPO, GITHUB_EVENT_NAME=event_name, GITHUB_EVENT_PATH=str(self.root / "event.json"),
+                    GITHUB_REF="refs/heads/master", GITHUB_SHA=self.sha, REVIEWED_SHA=self.sha, GITHUB_OUTPUT=str(output))
+        full.update(env)
+        r = subprocess.run(["python3", "-I", str(BASE / "scripts/release-candidate.py"), "check"], cwd=self.repo, env=full, capture_output=True, text=True)
+        r.outputs = dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+        return r
+    def assert_refused(self, r, reason):
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr); self.assertIn(reason, r.stderr); self.assertEqual(r.outputs.get("outcome"), "REFUSED")
+
+    def test_successful_push_ci_for_the_current_master_head_is_eligible(self):
+        r = self.check(); self.assertEqual(r.returncode, 0, r.stdout + r.stderr); self.assertEqual(r.outputs["outcome"], "ELIGIBLE")
+    def test_pull_request_ci_never_deploys(self):
+        self.event["workflow_run"]["event"] = "pull_request"; self.assert_refused(self.check(), "pull request")
+    def test_fork_ci_never_deploys_even_from_a_branch_called_master(self):
+        self.event["workflow_run"].update(event="pull_request", head_repository={"full_name": "attacker/opportunity-platform"})
+        self.assert_refused(self.check(), "pull request")
+        self.event["workflow_run"]["event"] = "push"; self.assert_refused(self.check(), "fork")
+    def test_failed_or_cancelled_master_ci_never_deploys(self):
+        for conclusion in ("failure", "cancelled", "skipped", None):
+            with self.subTest(conclusion=conclusion):
+                self.event["workflow_run"]["conclusion"] = conclusion; self.assert_refused(self.check(), "not success")
+    def test_another_workflow_or_repository_cannot_stand_in_for_ci(self):
+        self.event["workflow_run"]["path"] = ".github/workflows/continuous-integration-lookalike.yml"; self.assert_refused(self.check(), "not continuous integration")
+        self.event = {"workflow_run": self.ci_run(41, repository={"full_name": "other/repo"})}; self.assert_refused(self.check(), "another repository")
+        self.event = {"workflow_run": self.ci_run(41, head_branch="feature")}; self.assert_refused(self.check(), "another branch")
+    def test_an_older_master_commit_is_stale_and_changes_nothing(self):
+        self.api["head"] = "c" * 40
+        r = self.check(); self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
+        self.assertEqual(r.outputs["outcome"], "SKIPPED_STALE_REVISION"); self.assertEqual(r.outputs["master_head"], "c" * 40)
+        self.assertIn("No production changes performed.", r.stdout)
+    def test_manual_dispatch_without_passing_ci_is_refused(self):
+        self.api["runs"] = []; self.assert_refused(self.check("workflow_dispatch"), "has not passed")
+    def test_manual_dispatch_off_master_is_refused_and_on_master_with_ci_is_eligible(self):
+        self.assert_refused(self.check("workflow_dispatch", GITHUB_REF="refs/heads/feature"), "started on master")
+        self.assertEqual(self.check("workflow_dispatch").returncode, 0)
+    def test_unexpected_events_are_refused(self):
+        for name in ("push", "pull_request_target", "schedule", "repository_dispatch"):
+            with self.subTest(event=name): self.assert_refused(self.check(name), "not from")
+    def test_ci_on_another_sha_branch_event_or_workflow_does_not_count(self):
+        for change in ({"head_sha": "d" * 40}, {"event": "pull_request"}, {"head_branch": "feature"}, {"conclusion": "failure"},
+                       {"path": ".github/workflows/deploy.yml"}, {"head_repository": {"full_name": "attacker/opportunity-platform"}}):
+            with self.subTest(change=change):
+                self.api["runs"] = [self.ci_run(41, **change)]; self.assert_refused(self.check("workflow_dispatch"), "has not passed")
+    def test_a_skipped_missing_or_failed_job_is_not_a_pass(self):
+        for jobs in ([{"name": n, "conclusion": "skipped" if n == JOBS[2] else "success"} for n in JOBS],
+                     [{"name": n, "conclusion": "success"} for n in JOBS[:-1]],
+                     [{"name": n, "conclusion": "success"} for n in JOBS] + [{"name": "extra", "conclusion": "failure"}]):
+            with self.subTest(jobs=[j["conclusion"] for j in jobs]):
+                self.api["jobs"] = {"41": jobs}; self.assert_refused(self.check(), "every required job")
+    def test_a_later_fully_green_attempt_counts(self):
+        self.api["runs"] = [self.ci_run(41), self.ci_run(42)]
+        self.api["jobs"] = {"41": [{"name": n, "conclusion": "success"} for n in JOBS], "42": [{"name": JOBS[0], "conclusion": "failure"}]}
+        self.assertEqual(self.check().returncode, 0)
+    def test_candidate_must_be_the_trigger_and_the_checkout(self):
+        self.assert_refused(self.check(REVIEWED_SHA="d" * 40), "differs from the commit")
+        self.assert_refused(self.check(REVIEWED_SHA=self.sha[:12]), "full 40-character")
+        self.event["workflow_run"]["head_sha"] = "d" * 40; self.api["head"] = "d" * 40
+        self.assert_refused(self.check(REVIEWED_SHA="d" * 40), "checkout is not the candidate")
+    def test_github_api_failure_refuses(self):
+        self.api["fail"] = True; self.assert_refused(self.check(), "GitHub API request failed")
+
+
+class ConfigTests(unittest.TestCase):
+    VALID = {"GCP_PROJECT": "fixture-project-1", "GCP_INSTANCE": "opportunity-platform", "GCP_ZONE": "us-central1-a",
+             "GCP_WORKLOAD_IDENTITY_PROVIDER": "projects/123456789/locations/global/workloadIdentityPools/github/providers/opportunity-platform",
+             "GCP_DEPLOY_SERVICE_ACCOUNT": "opportunity-deploy@fixture-project-1.iam.gserviceaccount.com", "REMOTE_RUN_AS": "fixture_owner"}
+    def config(self, **changes):
+        env = {k: v for k, v in os.environ.items() if k not in self.VALID}; env.update(self.VALID); env.update(changes)
+        env = {k: v for k, v in env.items() if v is not None}
+        return subprocess.run(["python3", "-I", str(BASE / "scripts/release-candidate.py"), "config"], env=env, capture_output=True, text=True)
+    def test_complete_configuration_passes(self):
+        self.assertEqual(self.config().returncode, 0)
+    def test_missing_wif_configuration_fails_before_anything_else(self):
+        for name in ("GCP_WORKLOAD_IDENTITY_PROVIDER", "GCP_DEPLOY_SERVICE_ACCOUNT", "GCP_PROJECT", "GCP_INSTANCE", "GCP_ZONE", "REMOTE_RUN_AS"):
+            for value in (None, ""):
+                with self.subTest(name=name, value=value):
+                    r = self.config(**{name: value}); self.assertEqual(r.returncode, 1); self.assertIn(f"{name} is not set", r.stderr)
+    def test_malformed_values_are_named_but_not_echoed(self):
+        for name, value in (("GCP_WORKLOAD_IDENTITY_PROVIDER", "projects/x/providers/oops-value"), ("GCP_DEPLOY_SERVICE_ACCOUNT", "someone@gmail.example"),
+                            ("REMOTE_RUN_AS", "root; id"), ("GCP_ZONE", "us-central1")):
+            with self.subTest(name=name):
+                r = self.config(**{name: value}); self.assertEqual(r.returncode, 1)
+                self.assertIn(f"{name} is not well formed", r.stderr); self.assertNotIn(value, r.stdout + r.stderr)
+
+
+class SummaryTests(unittest.TestCase):
+    """The job summary says what happened, and is never a success production does not confirm."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup); self.root = pathlib.Path(self.tmp.name)
+    def status(self, revision=SHA, migrations=11):
+        return ("Configured image: opportunity-app:x\nRunning immutable image: sha256:" + "e" * 64 + "\nActual access mode: cloudflare\n"
+                "No pending release journal\nDEPLOYED_REVISION=" + revision + "\nDEPLOYED_IMAGE=sha256:" + "e" * 64 + "\n"
+                + "".join(f"MIGRATION={v}:{'0' * 96}\n" for v in range(1, migrations + 1)) + "MIGRATIONS_END\n")
+    def summary(self, gate="", deploy="", status=None, **steps):
+        files = {}
+        for name, text in (("gate", gate), ("deploy", deploy), ("status", status)):
+            if text is not None:
+                files[name] = self.root / name; files[name].write_text(text)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("STEP_")}
+        env.update(REVIEWED_SHA=SHA, **{k.upper(): v for k, v in steps.items()})
+        args = ["summary"] + [f"--{'status' if n == 'status' else n + '-outcome'}={p}" for n, p in files.items()]
+        return subprocess.run(["python3", "-I", str(BASE / "scripts/release-candidate.py"), *args], env=env, capture_output=True, text=True)
+    ok = dict(step_config="success", step_candidate="success", candidate_result="ELIGIBLE", step_auth="success", step_gate="success")
+    def test_verified_success_lists_every_fact(self):
+        r = self.summary(gate=f"PREVIOUS_REVISION={'a' * 40}\nOUTCOME=DEPLOY\nRELEASE_TYPE=code-only\n",
+                         deploy="OUTCOME=DEPLOYED\nCHANGED=yes\nROLLBACK_REF=opportunity-app:rollback-t\nJOURNAL=t\n",
+                         status=self.status(), step_build="success", step_preflight="success", step_deploy="success", **self.ok)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for expected in ("**Result: SUCCESS**", f"| Candidate SHA | `{SHA}` |", f"| Previously deployed SHA | `{'a' * 40}` |",
+                         f"| Running SHA | `{SHA}` |", "| Database migrations | 0011 |", "| Release type | code-only |",
+                         "| Image verified | yes", "| Transfer checksum verified | yes", "| Application ready | yes",
+                         "| Authentication enforced | yes (ACCESS_MODE=cloudflare", "| Rollback image retained | yes (`opportunity-app:rollback-t`)"):
+            self.assertIn(expected, r.stdout)
+    def test_reported_success_that_production_contradicts_fails(self):
+        r = self.summary(deploy="OUTCOME=DEPLOYED\n", status=self.status("a" * 40), step_build="success", step_preflight="success", step_deploy="success", **self.ok)
+        self.assertEqual(r.returncode, 1); self.assertIn("**Result: FAILED**", r.stdout); self.assertNotIn("SUCCESS", r.stdout)
+        r = self.summary(deploy="OUTCOME=DEPLOYED\n", status=None, step_deploy="success", **self.ok)
+        self.assertEqual(r.returncode, 1); self.assertIn("**Result: FAILED**", r.stdout)
+    def test_stale_already_deployed_and_disabled_runs_are_not_failures(self):
+        r = self.summary(step_config="success", step_candidate="success", candidate_result="SKIPPED_STALE_REVISION", master_head="c" * 40,
+                         step_auth="skipped", step_gate="skipped", step_deploy="skipped")
+        self.assertEqual(r.returncode, 0); self.assertIn("**Result: SKIPPED_STALE_REVISION**", r.stdout); self.assertIn("c" * 40, r.stdout)
+        self.assertIn("No deployment was attempted", r.stdout)
+        r = self.summary(gate="OUTCOME=ALREADY_DEPLOYED\n", status=self.status(), step_deploy="skipped", **self.ok)
+        self.assertEqual(r.returncode, 0); self.assertIn("**Result: ALREADY_DEPLOYED**", r.stdout); self.assertIn("| Production changed | no |", r.stdout)
+    def test_migration_required_names_the_migrations_and_the_owner_action(self):
+        r = self.summary(gate="OUTCOME=MIGRATION_REQUIRED\nPENDING_MIGRATIONS=0012_fixture.sql\n", step_build="skipped", **dict(self.ok, step_gate="failure"))
+        self.assertEqual(r.returncode, 1); self.assertIn("**Result: MIGRATION_REQUIRED**", r.stdout)
+        self.assertIn("`0012_fixture.sql`", r.stdout); self.assertIn("verified manual migration rollout", r.stdout)
+    def test_rollback_and_unknown_outcomes_are_failures_that_say_so(self):
+        r = self.summary(deploy="OUTCOME=ROLLED_BACK\nSTAGE=loading image\nROLLBACK=succeeded\n", status=self.status("a" * 40), step_deploy="failure", **self.ok)
+        self.assertEqual(r.returncode, 1); self.assertIn("**Result: ROLLED_BACK**", r.stdout); self.assertIn("| Rollback | succeeded |", r.stdout)
+        self.assertIn("| Failed or stopping stage | loading image |", r.stdout); self.assertIn("| Recovery required | no |", r.stdout)
+        r = self.summary(step_deploy="failure", **self.ok)
+        self.assertEqual(r.returncode, 1); self.assertIn("**Result: RECOVERY_REQUIRED**", r.stdout); self.assertIn("| Recovery required | yes |", r.stdout)
+        self.assertIn("Do not re-run the deploy", r.stdout)
+    def test_failures_before_production_name_their_stage(self):
+        for steps, stage in ((dict(step_config="failure"), "configuration"), (dict(self.ok, step_auth="failure"), "GCP authentication"),
+                             (dict(self.ok, step_build="failure"), "image build"), (dict(self.ok, step_build="success", step_preflight="failure"), "preflight")):
+            with self.subTest(stage=stage):
+                r = self.summary(**steps); self.assertEqual(r.returncode, 1); self.assertIn(stage, r.stdout); self.assertIn("| Production changed | no |", r.stdout)
+        r = self.summary(step_config="success", step_candidate="failure", candidate_reason="continuous integration has not passed")
+        self.assertIn("**Result: REFUSED**", r.stdout); self.assertIn("continuous integration has not passed", r.stdout)
+    def test_nothing_from_the_status_beyond_its_facts_is_printed(self):
+        status = self.status() + "POSTGRES_PASSWORD=" + MARKER + "\n"
+        r = self.summary(deploy="OUTCOME=DEPLOYED\n", status=status, step_deploy="success", **self.ok)
+        self.assertNotIn(MARKER, r.stdout + r.stderr)
+
+
+class WorkflowTests(unittest.TestCase):
+    """What actionlint cannot know: the deploy workflow's trust boundary and order of operations."""
+    def setUp(self):
+        self.deploy = (BASE / ".github/workflows/deploy.yml").read_text()
+    def step(self, marker): return self.deploy.index(marker, self.deploy.index("    steps:\n"))
+    def test_deployment_stays_behind_the_owner_switch_and_trusted_triggers(self):
+        condition = self.deploy.split("    if: >-\n", 1)[1].split("    runs-on:", 1)[0]
+        self.assertTrue(condition.strip().startswith("vars.DEPLOY_ENABLED == 'true' && ("), condition)
+        for clause in ("github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.event == 'push'",
+                       "github.event.workflow_run.head_branch == 'master'", "github.event.workflow_run.head_repository.full_name == github.repository",
+                       "github.event.workflow_run.repository.full_name == github.repository",
+                       "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'"):
+            self.assertIn(clause, condition)
+        for path in (BASE / ".github/workflows").glob("*.yml"):
+            self.assertNotRegex(path.read_text(), r"DEPLOY_ENABLED\s*(=|:)\s*['\"]?true|variable set DEPLOY_ENABLED", path.name)
+    def test_permissions_are_granted_to_the_deploy_job_alone(self):
+        self.assertIn("\npermissions: {}\n", self.deploy)
+        self.assertIn("    permissions:\n      contents: read\n      actions: read\n      id-token: write\n", self.deploy)
+        self.assertIn("\npermissions: {}\n", (BASE / ".github/workflows/backup.yml").read_text())
+        self.assertNotIn("write-all", self.deploy); self.assertEqual(self.deploy.count("id-token: write"), 1)
+    def test_checks_run_before_credentials_and_head_is_checked_before_build_and_before_change(self):
+        order = ["actions/checkout@", "release-candidate.py config", "release-candidate.py check", "google-github-actions/auth@",
+                 "deploy-vm.sh --gate", "run: ./scripts/release-image.sh", "deploy-vm.sh --preflight", 'deploy-vm.sh "dist/']
+        positions = [self.step(marker) for marker in order]; self.assertEqual(positions, sorted(positions))
+        self.assertIn("if: steps.candidate.outputs.outcome == 'ELIGIBLE'", self.deploy.split("google-github-actions/auth@", 1)[1].split("with:", 1)[0])
+        self.assertIn("REQUIRE_CURRENT_HEAD: 'yes'", self.deploy)
+        self.assertNotIn("--migration-rollout", self.deploy.split("jobs:", 1)[1])
+        self.assertIn("cancel-in-progress: false", self.deploy); self.assertIn("group: production", self.deploy)
+    def test_no_runner_context_where_it_is_unavailable_and_actions_are_pinned(self):
+        self.assertNotIn("${{ runner.", self.deploy)
+        for path in (BASE / ".github/workflows").glob("*.yml"):
+            for uses in re.findall(r"uses:\s*(\S+)", path.read_text()):
+                self.assertRegex(uses, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$", f"{path.name}: {uses}")
+    def test_required_jobs_are_every_ci_job(self):
+        hygiene = (BASE / ".github/workflows/hygiene.yml").read_text()
+        names = re.findall(r"^    name: (.+)$", hygiene, re.M)
+        spec = importlib.util.spec_from_file_location("release_candidate", BASE / "scripts/release-candidate.py")
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        self.assertEqual(sorted(module.REQUIRED_JOBS), sorted(names)); self.assertEqual(sorted(JOBS), sorted(names))
+
+
+class DockerfileTests(unittest.TestCase):
+    """CI never builds the image, so whatever the compiler reads from outside crates/ at build time
+    has to be copied into the server stage, or every release fails at its build."""
+    def test_files_compiled_into_the_binary_are_in_the_build_stage(self):
+        root = BASE.resolve()
+        stage = (root / "Dockerfile").read_text().split(" AS server\n", 1)[1].split("\nFROM ", 1)[0]
+        copied = [src.rstrip("/") for line in re.findall(r"^COPY (.+)$", stage, re.M) for src in line.split()[:-1] if not src.startswith("--")]
+        needed = set()
+        for path in (root / "crates").glob("*/src/**/*.rs"):
+            code = path.read_text().split("#[cfg(test)]", 1)[0]
+            crate = root / "crates" / path.relative_to(root / "crates").parts[0]
+            for macro, argument in re.findall(r'(include_str|include_bytes|sqlx::migrate)!\("([^"]+)"\)', code):
+                target = ((crate if macro == "sqlx::migrate" else path.parent) / argument).resolve()
+                needed.add(str(target.relative_to(root)))
+        self.assertIn("config/sources.seed.toml", needed)
+        self.assertEqual([n for n in sorted(needed) if not any(n == c or n.startswith(c + "/") for c in copied)], [])
 
 
 if __name__ == "__main__":

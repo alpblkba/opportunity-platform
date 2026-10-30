@@ -48,6 +48,20 @@ class PrivacyGuardTests(unittest.TestCase):
         self.add('.env.prod',force=True)
         self.assertNotEqual(self.run_guard().returncode,0)
 
+    def test_deploy_credential_is_ignored_and_force_stage_rejected(self):
+        for path in ('gha-creds-0123abcd.json', 'nested/gha-creds-0123abcd.json'):
+            with self.subTest(path=path):
+                target = self.repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('{"type": "external_account", "synthetic": true}')
+                ignored = subprocess.run(['git', 'check-ignore', '-q', '--', path], cwd=self.repo)
+                self.assertEqual(ignored.returncode, 0, path)
+                self.add(path, force=True)
+                result = self.run_guard()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('credential', result.stdout)
+                subprocess.run(['git', 'rm', '-q', '--cached', '--', path], cwd=self.repo, check=True)
+
     def test_nested_private_force_stage_rejected(self):
         self.add('apps/browser-worker/private/browser/form.png',force=True)
         self.assertNotEqual(self.run_guard().returncode,0)

@@ -19,6 +19,7 @@ required = [
     "!**/tests/fixtures/**/*.pdf",
     "!**/tests/fixtures/**/*.docx",
     "/google-cloud-sdk/",
+    "gha-creds-*.json",
 ]
 missing = [pattern for pattern in required if pattern not in ignore.splitlines()]
 if missing:
@@ -81,6 +82,9 @@ for name in paths:
                         unsafe.append((name, f"{key} must use a PostgreSQL URL with empty or REPLACE_WITH_* credentials"))
                 except ValueError:
                     unsafe.append((name, f"{key} is not a valid example PostgreSQL URL"))
+        continue
+    if name_lower.startswith("gha-creds-") and name_lower.endswith(".json"):
+        unsafe.append((name, "Google Cloud credential written by google-github-actions/auth"))
         continue
     if name_lower.endswith((".sqlite", ".sqlite3", ".db", ".dump", ".pem", ".key", ".p12", ".pfx", ".pages", ".rtf")):
         unsafe.append((name,"sensitive binary/file type"))

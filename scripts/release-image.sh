@@ -20,19 +20,34 @@ REVISION="$(git rev-parse HEAD)"
 BUILD_LOCK="${TMPDIR:-/tmp}/opportunity-image-${REVISION}.lock"
 umask 077
 mkdir "$BUILD_LOCK" || { echo 'A build lock exists for this revision; inspect it before retrying' >&2; exit 1; }
-trap 'rmdir "$BUILD_LOCK"' EXIT
 OUT_DIR="${RELEASE_DIR:-dist}"
 ARCH=amd64
 TAG="opportunity-app:${REVISION}-amd64"
 ARCHIVE="${OUT_DIR}/opportunity-app-${REVISION}-amd64.tar.gz"
+CONTEXT=""
+cleanup() {
+  [[ -z "$CONTEXT" ]] || rm -rf "$CONTEXT"
+  rm -f "${ARCHIVE}.partial"
+  rmdir "$BUILD_LOCK"
+}
+trap cleanup EXIT
 if docker image inspect "$TAG" >/dev/null 2>&1 || [[ -e "$ARCHIVE" || -e "${ARCHIVE}.sha256" ]]; then
   echo 'Release tag or archive already exists; do not replace a reviewed artifact' >&2
   exit 1
 fi
 
+# The context is the reviewed commit's tracked files, not this directory. Whatever else is here -
+# the gha-creds-*.json google-github-actions/auth writes into the workspace, a local .env, a CV -
+# never reaches the daemon, however .dockerignore is written. Modes as a checkout would have them,
+# because COPY keeps them and the runtime user has to read /app/config.
+CONTEXT="$(mktemp -d "${TMPDIR:-/tmp}/opportunity-context-XXXXXX")"
+git -c tar.umask=0022 archive --format=tar "$REVISION" | tar -x -p -f - -C "$CONTEXT"
+[[ -f "$CONTEXT/Dockerfile" ]] || { echo 'The reviewed commit has no Dockerfile' >&2; exit 1; }
+[[ -z "$(find "$CONTEXT" -name 'gha-creds-*.json' | head -1)" ]] || { echo 'The reviewed commit tracks a deploy credential; refusing to build' >&2; exit 1; }
+
 echo "building ${TAG} for ${PLATFORM} (target: ${TARGET})"
 docker buildx build --platform linux/amd64 --target runtime --provenance=false --sbom=false \
-  --build-arg "GIT_REVISION=$REVISION" -t "$TAG" --load .
+  --build-arg "GIT_REVISION=$REVISION" -t "$TAG" --load "$CONTEXT"
 [[ -z "$(git status --porcelain --untracked-files=all)" && "$(git rev-parse HEAD)" == "$REVISION" ]] || { echo 'Checkout changed during build; discard this artifact' >&2; exit 1; }
 [[ "$(docker image inspect "$TAG" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" == "$REVISION" ]] || { echo 'Wrong built revision' >&2; exit 1; }
 
@@ -44,20 +59,14 @@ built_arch="$(docker image inspect "$TAG" --format '{{.Architecture}}')"
 [[ "$built_arch" == "$ARCH" ]] || { echo "built ${built_arch}, expected ${ARCH}" >&2; exit 1; }
 
 echo "checking the image"
-docker run --rm --platform "$PLATFORM" --entrypoint sh "$TAG" -c '
-  set -e
-  opportunity --version
-  test -f /app/apps/web/dist/index.html || { echo "no built frontend in the image" >&2; exit 1; }
-  # Nothing private may ride along. The build context excludes it, and this is the check that the
-  # exclusion still holds.
-  found=$(find / -xdev \( -name ".env" -o -name ".env.prod" -o -name "*.dump" -o -name "*.p12" \) 2>/dev/null | head -5)
-  if [ -n "$found" ]; then echo "secrets in the image: $found" >&2; exit 1; fi
-  test -z "$(ls -A /app/private 2>/dev/null | grep -v browser)" || { echo "private tree is not empty" >&2; exit 1; }
-'
+docker run --rm -i --platform "$PLATFORM" --user 0 --entrypoint sh "$TAG" -s < scripts/image-check.sh
 
 mkdir -p "$OUT_DIR"
 echo "packaging ${ARCHIVE}"
-docker save "$TAG" | gzip -9 > "$ARCHIVE"
+# Written under another name and renamed whole, so an interrupted save never leaves a file that
+# looks like a release archive.
+docker save "$TAG" | gzip -9 > "${ARCHIVE}.partial"
+mv "${ARCHIVE}.partial" "$ARCHIVE"
 if command -v shasum >/dev/null; then
   shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
 else
